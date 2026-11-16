@@ -17,7 +17,7 @@ ENDPOINT_NAME="${VAST_ENDPOINT:-zonos3-tts}"
 VAST_URL=https://console.vast.ai/api/v0
 DISK_GB=16
 GPU_RAM_GB=8
-MAX_DPH="${VAST_MAX_DPH:-0.35}"
+MAX_DPH="${VAST_MAX_DPH:-0.15}"
 SEARCH_PARAMS="gpu_name in [RTX_3060,RTX_3060_Ti,RTX_3070,RTX_3070_Ti,RTX_3080,RTX_3080_Ti,RTX_A4000,RTX_A4500,\
 RTX_A5000,RTX_4060_Ti,RTX_4070,RTX_4070_Ti,RTX_4000Ada,RTX_3090,RTX_4080,RTX_4090] dph_total<=$MAX_DPH \
 compute_cap>=860 compute_cap<900 gpu_ram>=$GPU_RAM_GB inet_down>=500 reliability>=0.98 cuda_max_good>=12.4 num_gpus=1 \
@@ -64,7 +64,7 @@ echo "template $TEMPLATE_NAME: $IMAGE:$TAG ($template_hash)"
 
 endpoint_body() {
   jq -n --arg name "$ENDPOINT_NAME" '{
-    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 1, max_workers: 2,
+    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 1, max_workers: 3,
     inactivity_timeout: 120, autoscaler_instance: "prod"
   }'
 }

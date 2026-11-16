@@ -1,5 +1,6 @@
 """Shared by the RunPod handler and the Vast PyWorker: run the local zonos3-server and call it.
-Voices: /app/voices/<id>.embedding.npy (precomputed speaker embeddings) or an inline reference WAV."""
+Voices: /app/voices/<language>/<voice>.ogg (bank: the same Gemini voice name in every language, cloned one-shot), or
+an inline reference WAV. A voice must come from a clip in the target language: cross-language clones drift and truncate."""
 import base64, io, subprocess, time, wave
 from pathlib import Path
 
@@ -40,19 +41,38 @@ def _duration(wav_bytes: bytes) -> float:
         return w.getnframes() / w.getframerate()
 
 
+_speakers = {}   # (language, voice) -> speaker id registered on this server; encoded once (~0.15 s on GPU)
+SESSION = {'X-TTS-Session-ID': 'bank'}
+
+
+def _speaker_id(language: str, voice: str) -> str:
+    key = (language, voice)
+    if key not in _speakers:
+        clip = VOICES / language / f'{voice}.ogg'
+        if not clip.is_file():
+            raise ValueError(f'no voice {voice!r} for language {language!r}')
+        r = requests.post(URL + '/v2/speakers', headers=SESSION, timeout=60,
+                          json={'label': f'{language}/{voice}', 'speaker_audio_base64': base64.b64encode(clip.read_bytes()).decode()})
+        if not r.ok:
+            raise RuntimeError(f'zonos3-server HTTP {r.status_code}: {r.text[:300]}')
+        _speakers[key] = r.json()['id']
+    return _speakers[key]
+
+
 def generate(data: dict) -> dict:
     text = data['text']
-    body = {'text': text, 'language': data.get('language', 'ru'), 'stream': False, 'format': 'wav',
-            'speaker_mode': 'embedding'}
+    language = data.get('language', 'ru')
+    body = {'text': text, 'language': language, 'stream': False, 'format': 'wav', 'speaker_mode': 'embedding'}
     if data.get('voice'):
-        body['speaker_embedding_base64'] = base64.b64encode((VOICES / f"{data['voice']}.embedding.npy").read_bytes()).decode()
+        body['speaker_embedding_id'] = _speaker_id(language, data['voice'])
     elif data.get('reference_wav_base64'):
         body['speaker_audio_base64'] = data['reference_wav_base64']
     seed = int(data.get('seed', 42))
     t = time.monotonic()
     for attempt in range(MAX_ATTEMPTS):
-        r = requests.post(URL + '/v2/generate', json={**body, 'seed': seed + attempt}, timeout=600)
-        r.raise_for_status()
+        r = requests.post(URL + '/v2/generate', headers=SESSION, json={**body, 'seed': seed + attempt}, timeout=600)
+        if not r.ok:
+            raise RuntimeError(f'zonos3-server HTTP {r.status_code}: {r.text[:300]}')
         audio_s = _duration(r.content)
         if audio_s >= len(text) / MIN_CHARS_PER_S:
             break
