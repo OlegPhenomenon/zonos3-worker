@@ -54,6 +54,8 @@ def sign_certificate(container_id: str) -> None:
                               headers={'Content-Type': 'application/octet-stream'}, timeout=(10, 60))
             if r.ok:
                 break
+            if r.status_code == 403:  # a refusal, not a transient error: no point retrying
+                raise SystemExit(f'could not get the instance TLS certificate signed: HTTP 403 {r.text[:120]}')
             detail = f'HTTP {r.status_code}'
         except requests.RequestException as e:
             detail = str(e)
@@ -80,7 +82,13 @@ def main():
     logging.basicConfig(level=logging.INFO)
     container_id = prepare_env()
     if os.environ['USE_SSL'] == 'true':
-        sign_certificate(container_id)
+        try:
+            sign_certificate(container_id)
+        except SystemExit as e:
+            # Some hosts reach Vast from another IP than their public one; Vast then refuses to sign ("Caller is not
+            # the instance machine", HTTP 403) and the worker used to exit, so Vast cycled hosts for 15+ minutes.
+            log.warning('%s; serving plain HTTP', e)
+            os.environ['USE_SSL'] = 'false'
     from vastai.serverless.server.worker import BenchmarkConfig, HandlerConfig, Worker, WorkerConfig
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[HandlerConfig(
         route='/tts', is_remote_dispatch=True, remote_function=tts, allow_parallel_requests=False,
