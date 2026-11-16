@@ -13,6 +13,9 @@ ARG HF=https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/main/gguf
 RUN mkdir -p /app/models && cd /app/models \
  && for f in backbone-ptq.gguf zac-keep2.gguf spk-encoder.gguf; do curl -fsSL -o "$f" "$HF/$f"; done
 ENV LD_LIBRARY_PATH=/app/build/ggml/src:/app/build/ggml/src/ggml-cuda:/app/build/ggml/src/ggml-cpu:/app/build/bin:$LD_LIBRARY_PATH
+# The server's own text normalizer as a shared library (release asset), for common.keep_latin_words.
+COPY libzyphra_textnorm.so.gz /tmp/
+RUN mkdir -p /app/lib && gunzip -c /tmp/libzyphra_textnorm.so.gz > /app/lib/libzyphra_textnorm.so && rm /tmp/libzyphra_textnorm.so.gz
 COPY voices/ /app/voices/
 COPY common.py handler.py vast_worker.py /app/
 # `vast` runs the Vast PyWorker; anything else (RunPod) the RunPod handler.

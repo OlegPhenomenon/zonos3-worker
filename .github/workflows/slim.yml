@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Private repo: fetch the prebuilt binaries with the job token instead of an anonymous URL.
-      - run: gh release download ggml-cuda-sm86-sm89-96d9e0e --repo ${{ github.repository }} -p '*.tgz' -D slim
+      - run: gh release download ggml-cuda-sm86-sm89-96d9e0e --repo ${{ github.repository }} -p '*.tgz' -p 'libzyphra_textnorm.so.gz' -D slim
         env:
           GH_TOKEN: ${{ github.token }}
       - uses: docker/setup-buildx-action@v3
