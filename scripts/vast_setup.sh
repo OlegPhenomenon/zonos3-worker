@@ -53,9 +53,11 @@ template_body() {
   }'
 }
 filters=$(jq -cn --arg name "$TEMPLATE_NAME" --arg image "$IMAGE" '{name: {eq: $name}, image: {eq: $image}}')
-old_hash=$(api GET /template/ -G --data-urlencode "select_filters=$filters" | jq -r '.templates[0].hash_id // empty')
-if [ -n "$old_hash" ]; then
-  template_hash=$(template_body | jq --arg h "$old_hash" '. + {hash_id: $h}' | send PUT /template/ | jq -r '.template.hash_id // empty')
+old=$(api GET /template/ -G --data-urlencode "select_filters=$filters" | jq -c '.templates[0] // empty | {id, hash_id}')
+if [ -n "$old" ]; then
+  # v0 PUT /template/ is gone (HTTP 410); v1 takes the template's id and hash_id.
+  template_hash=$(template_body | jq --argjson o "$old" '. + $o' \
+    | VAST_URL=https://console.vast.ai/api/v1 send PUT /template/ | jq -r '.template.hash_id // .hash_id // empty')
 else
   template_hash=$(template_body | send POST /template/ | jq -r '.template.hash_id // empty')
 fi
