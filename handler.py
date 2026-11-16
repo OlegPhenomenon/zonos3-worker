@@ -17,7 +17,7 @@ load_s = time.monotonic()-started
 def handler(job):
     data=job['input']
     t=time.monotonic()
-    request={'text':data['text'], 'speaker_audio_base64':data['reference_wav_base64'], 'speaker_mode':'reference','decoder':'full_mr','stream':False,'format':'wav','seed':42}
+    request={'text':data['text'], 'speaker_audio_base64':data['reference_wav_base64'], 'speaker_mode':'reference','decoder':'full_mr','language':data['language'],'stream':False,'format':'wav','seed':42}
     r=requests.post('http://127.0.0.1:1919/v2/generate',json=request,timeout=1200)
     r.raise_for_status()
     gpu=subprocess.check_output(['nvidia-smi','--query-gpu=name,memory.used,memory.total','--format=csv,noheader,nounits'],text=True).strip()
