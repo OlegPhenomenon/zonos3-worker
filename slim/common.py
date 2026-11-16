@@ -94,7 +94,7 @@ def generate(data: dict) -> dict:
     # raised speaker cosine to the reference 0.795 -> 0.849 (min 0.728 -> 0.820) and cut the loudness spread
     # 2.1 -> 0.5 dB SD. Lower temperature and a fixed speaking_rate made it worse (rate 14.5 halved the pace).
     body = {'text': text, 'language': language, 'stream': False, 'format': 'wav', 'speaker_mode': 'embedding',
-            'speaker_cfg_scale': 1.5, 'condition_values': {'loudness': -20.0}}
+            'condition_values': {'loudness': -20.0}}
     nemo = NON_LATIN_SCRIPT.get(language)
     if nemo and LATIN_WORD.search(text):
         body.update(text=keep_latin_words(text, nemo), text_normalization=False)
@@ -102,6 +102,8 @@ def generate(data: dict) -> dict:
         body['speaker_embedding_id'] = _speaker_id(language, data['voice'])
     elif data.get('reference_wav_base64'):
         body['speaker_audio_base64'] = data['reference_wav_base64']
+    if 'speaker_embedding_id' in body or 'speaker_audio_base64' in body:
+        body['speaker_cfg_scale'] = 1.5  # the server refuses speaker CFG without a speaker (HTTP 400)
     seed = int(data.get('seed', 42))
     t = time.monotonic()
     for attempt in range(MAX_ATTEMPTS):

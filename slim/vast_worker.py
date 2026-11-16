@@ -16,7 +16,9 @@ log = logging.getLogger('zonos3.vast')
 SDK_ENV_DEFAULTS = {'REPORT_ADDR': 'https://run.vast.ai', 'WORKER_PORT': '3000', 'USE_SSL': 'true'}
 SIGN_CERT_URL = 'https://console.vast.ai/api/v0/sign_cert/'
 CERT_FILE, KEY_FILE = Path('/etc/instance.crt'), Path('/etc/instance.key')
-BENCH = {'text': 'Привет! Сегодня мы разберём, как устроен этот курс.', 'language': 'ru'}
+# The startup benchmark must take the production path (a bank voice): a voice-less request is a 400 under speaker CFG,
+# and a failed benchmark kills the worker ("Lifecycle startup failed"), so Vast churns through fresh hosts.
+BENCH = {'text': 'Привет! Сегодня мы разберём, как устроен этот курс.', 'language': 'ru', 'voice': 'Charon'}
 
 
 def prepare_env() -> str:
