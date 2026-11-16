@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Binaries run on older 12.x drivers through CUDA minor-version compatibility; don't let the image refuse them.
 ENV NVIDIA_DISABLE_REQUIRE=1
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ffmpeg libgomp1 ca-certificates curl \
- && rm -rf /var/lib/apt/lists/* && pip3 install --no-cache-dir runpod requests vastai==1.8.3
+ && rm -rf /var/lib/apt/lists/* && pip3 install --no-cache-dir -U pip && pip3 install --no-cache-dir runpod requests vastai==1.8.3
 COPY zonos3-ggml-cuda-sm86-89.tgz /tmp/bin.tgz
 RUN mkdir -p /app && tar xzf /tmp/bin.tgz -C /app && rm /tmp/bin.tgz
 ARG HF=https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/main/gguf
