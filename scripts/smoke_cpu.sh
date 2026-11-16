@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 H=root@161.97.163.85
-ssh "$H" 'mkdir -p /root/smoke/voices/ru /root/smoke/lib && cp -n /root/tn/libzyphra_textnorm.so /root/smoke/lib/'
+ssh "$H" 'mkdir -p /root/smoke/voices/ru /root/smoke/lib && cp --update=none /root/tn/libzyphra_textnorm.so /root/smoke/lib/'
 scp -q slim/common.py slim/vast_worker.py "$H":/root/smoke/
 scp -q slim/voices/ru/Charon.ogg slim/voices/ru/Kore.ogg "$H":/root/smoke/voices/ru/
 ssh "$H" 'cd /root/smoke && sed -i "s#/app/lib/#/root/smoke/lib/#; s#Path(\x27/app/voices\x27)#Path(\x27/root/smoke/voices\x27)#" common.py
@@ -19,7 +19,9 @@ python3 - <<EOF
 import ast, json, common
 bench = ast.literal_eval(next(l for l in open("vast_worker.py") if l.startswith("BENCH =")).split("=", 1)[1].strip())
 cases = {"startup benchmark": bench,
-         "latin words": {"text": "Откройте Python и запустите Docker через API.", "language": "ru", "voice": "Kore"}}
+         "latin words": {"text": "Откройте Python и запустите Docker через API.", "language": "ru", "voice": "Kore"},
+         "tuning params": {"text": "Проверка параметров.", "language": "ru", "voice": "Kore",
+                           "params": {"temperature": 0.7, "speaker_cfg_scale": 1.8, "bogus": 1}}}
 for name, payload in cases.items():
     r = common.generate(payload); r.pop("wav_base64")
     assert r["audio_s"] > 0.5, (name, r)

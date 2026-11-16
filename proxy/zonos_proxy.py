@@ -16,6 +16,7 @@ KEY = os.environ['ZONOS_ENDPOINT_KEY']
 TOKEN = os.environ['ZONOS_PROXY_TOKEN']
 HERE = Path(__file__).resolve().parent
 LOG = HERE / 'requests.jsonl'
+PARAMS = HERE / 'params.json'
 CA = HERE / 'jvastai_root.cer'
 if not CA.exists():
     CA.write_bytes(urllib.request.urlopen('https://console.vast.ai/static/jvastai_root.cer').read())
@@ -112,7 +113,9 @@ class Handler(BaseHTTPRequestHandler):
             text = str(data['text']).strip()
             payload = {'text': text, 'language': zonos_language(str(data.get('language', 'ru'))),
                        'voice': str(data['voice']), 'seed': int(data.get('seed', 42))}
-            row.update(chars=len(text), language=payload['language'], voice=payload['voice'])
+            if PARAMS.exists():  # live tuning: edit params.json on the server, no restart or rebuild
+                payload['params'] = json.loads(PARAMS.read_text())
+            row.update(chars=len(text), language=payload['language'], voice=payload['voice'], params=payload.get('params'))
             wav, meta = synthesize(payload)
             row.update(meta)
             self.reply(200, wav, 'audio/wav', {'X-Audio-S': meta['audio_s'], 'X-Generation-S': round(meta['generation_s'], 3),

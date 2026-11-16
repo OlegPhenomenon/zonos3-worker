@@ -11,6 +11,8 @@ VOICES = Path('/app/voices')
 MAX_ATTEMPTS = 3          # Zonos sometimes stops early; a different seed fixes it
 MIN_CHARS_PER_S = 25.0    # shortest plausible speech for the text: fewer seconds than chars/25 = truncated
 load_s = None
+TUNABLE = {'speaker_cfg_scale', 'temperature', 'topk', 'top_p', 'min_p', 'condition_values', 'repetition_penalty',
+           'repetition_window', 'silence_prefill_frames'}
 gpu = None
 
 
@@ -104,6 +106,8 @@ def generate(data: dict) -> dict:
         body['speaker_audio_base64'] = data['reference_wav_base64']
     if 'speaker_embedding_id' in body or 'speaker_audio_base64' in body:
         body['speaker_cfg_scale'] = 1.5  # the server refuses speaker CFG without a speaker (HTTP 400)
+    # Tuning without an image rebuild: the caller (the proxy's params.json) may override these sampling fields.
+    body.update({k: v for k, v in (data.get('params') or {}).items() if k in TUNABLE})
     seed = int(data.get('seed', 42))
     t = time.monotonic()
     for attempt in range(MAX_ATTEMPTS):
