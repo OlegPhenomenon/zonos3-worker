@@ -1,3 +1,5 @@
 bank/refs/
 __pycache__/
 bank/build.log
+proxy/.token
+proxy/*.wav
