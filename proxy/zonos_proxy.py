@@ -4,12 +4,14 @@ must not ship inside the extension.
 POST /tts {text, language, voice, seed?} with X-Zonos-Token -> audio/wav; every request is logged to requests.jsonl.
 GET /status -> worker state + wake estimate (CORS open: read by the content script; does not wake the worker).
 GET /stats -> totals. Env: ZONOS_ENDPOINT_KEY, ZONOS_PROXY_TOKEN."""
-import base64, io, json, os, threading, time, urllib.request, wave
+import base64, io, json, math, os, subprocess, threading, time, urllib.request, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
 import requests
+
+from f0 import median_f0
 
 ENDPOINT = 'zonos3-tts'
 ENDPOINT_ID = 44925
@@ -54,6 +56,34 @@ def hf_db(wav: bytes) -> float:
         f = np.fft.rfftfreq(len(x), 1 / w.getframerate())
     p = np.abs(np.fft.rfft(x)) ** 2
     return round(float(10 * np.log10(p[f > 4000].sum() / max(p[f > 100].sum(), 1e-9))), 1)
+
+
+# Pitch leveling: embedding-mode Zonos picks a different pitch per chunk (one lecture: 115-208 Hz around the voice's
+# 145, neighbours up to 3-4 semitones apart, heard as "each chunk in another key"). Each chunk's median F0 is moved
+# toward its bank clip's F0 with formant-preserving rubberband, at most MAX_SHIFT_ST; below MIN_SHIFT_ST it is left.
+MAX_SHIFT_ST, MIN_SHIFT_ST = 4.0, 0.5
+VOICES = HERE / 'voices'  # copy of slim/voices: <lang>/<Voice>.ogg
+_voice_f0: dict[tuple[str, str], float] = {}
+
+
+def ffmpeg(args: list[str], data: bytes) -> bytes:
+    return subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', *args], input=data, capture_output=True, check=True).stdout
+
+
+def level_pitch(wav: bytes, language: str, voice: str) -> tuple[bytes, float, float]:
+    key = (language, voice)
+    if key not in _voice_f0:
+        clip = (VOICES / language / f'{voice}.ogg').read_bytes()
+        _voice_f0[key] = median_f0(ffmpeg(['-i', 'pipe:0', '-ar', '44100', '-ac', '1', '-f', 'wav', 'pipe:1'], clip))
+    f0 = median_f0(wav)
+    if f0 != f0:  # no voiced frames
+        return wav, f0, 0.0
+    shift = max(-MAX_SHIFT_ST, min(MAX_SHIFT_ST, 12 * math.log2(_voice_f0[key] / f0)))
+    if abs(shift) < MIN_SHIFT_ST:
+        return wav, f0, 0.0
+    out = ffmpeg(['-i', 'pipe:0', '-af', f'rubberband=pitch={2 ** (shift / 12):.5f}:formant=preserved',
+                  '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1'], wav)
+    return out, f0, round(shift, 2)
 
 
 def zonos_language(lang: str) -> str:
@@ -133,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
             row['file'] = f"{row['utc'].replace(':', '')}_{threading.get_ident() % 10000}.wav"
             (AUDIO / row['file']).write_bytes(wav)
             row['hf_db'] = hf_db(wav)
+            if (payload.get('params') or {}).get('pitch_level', True):
+                wav, row['f0_hz'], row['pitch_shift_st'] = level_pitch(wav, payload['language'], payload['voice'])
             self.reply(200, wav, 'audio/wav', {'X-Audio-S': meta['audio_s'], 'X-Generation-S': round(meta['generation_s'], 3),
                                                'X-Attempts': meta['attempts']})
         except Exception as e:  # noqa: BLE001 — every failure goes back to the caller and into the log
