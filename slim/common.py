@@ -112,4 +112,5 @@ def generate(data: dict) -> dict:
         if audio_s >= len(text) / MIN_CHARS_PER_S:
             break
     return {'wav_base64': base64.b64encode(r.content).decode(), 'audio_s': audio_s, 'attempts': attempt + 1,
-            'generation_s': time.monotonic() - t, 'model_load_s': load_s, 'gpu': gpu}
+            'generation_s': time.monotonic() - t, 'model_load_s': load_s, 'gpu': gpu,
+            'text_sent': body['text'], 'text_normalization': body.get('text_normalization', True)}
