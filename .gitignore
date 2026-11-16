@@ -3,3 +3,4 @@ __pycache__/
 bank/build.log
 proxy/.token
 proxy/*.wav
+proxy/.token.old-leaked
