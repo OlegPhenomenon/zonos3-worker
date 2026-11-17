@@ -26,4 +26,9 @@ for name, payload in cases.items():
     r = common.generate(payload); r.pop("wav_base64")
     assert r["audio_s"] > 0.5, (name, r)
     print("OK", name, json.dumps({k: r[k] for k in ("audio_s", "attempts", "text_sent", "text_normalization")}, ensure_ascii=False))
+from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(4) as pool:  # the worker serves 4 requests at once (allow_parallel_requests)
+    rs = list(pool.map(common.generate, [bench] * 4))
+assert all(r["audio_s"] > 0.5 for r in rs), [r["audio_s"] for r in rs]
+print("OK 4 parallel", [round(r["audio_s"], 2) for r in rs])
 EOF'

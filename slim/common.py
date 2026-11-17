@@ -92,11 +92,12 @@ def _speaker_id(language: str, voice: str) -> str:
 def generate(data: dict) -> dict:
     text = data['text']
     language = data.get('language', 'ru')
-    # Uniform chunks (6 ru sentences, one voice, CPU A/B 2026-11-16): reference CFG 1.5 + a fixed loudness condition
-    # raised speaker cosine to the reference 0.795 -> 0.849 (min 0.728 -> 0.820) and cut the loudness spread
-    # 2.1 -> 0.5 dB SD. Lower temperature and a fixed speaking_rate made it worse (rate 14.5 halved the pace).
+    # Uniform chunks: reference CFG 1.5 + fixed loudness (CPU A/B 2026-11-16: speaker cosine 0.795 -> 0.849, loudness
+    # spread 2.1 -> 0.5 dB SD). temperature 0.5 cut the pitch spread between chunks 6.1 -> 3.5 semitones, and a fixed
+    # speaking_rate keeps every chunk at one pace; the client speeds speech up itself (atempo). Both chosen by ear
+    # on whole lectures (2026-11-17): model-side pace changes hurt quality.
     body = {'text': text, 'language': language, 'stream': False, 'format': 'wav', 'speaker_mode': 'embedding',
-            'condition_values': {'loudness': -20.0}}
+            'temperature': 0.5, 'condition_values': {'loudness': -20.0, 'speaking_rate': 22.0}}
     nemo = NON_LATIN_SCRIPT.get(language)
     if nemo and LATIN_WORD.search(text):
         body.update(text=keep_latin_words(text, nemo), text_normalization=False)

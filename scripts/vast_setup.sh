@@ -6,7 +6,7 @@
 #
 # Cost policy: Zonos needs ~3 GB VRAM, so the workergroup only admits cheap 8–24 GB Ampere/Ada cards under a price
 # cap; Vast's engine recruits by price-performance, so cheap cards win and pricier ones are taken only when nothing
-# cheaper is free. cold_workers=1 keeps one stopped worker with the image already pulled (storage-only billing),
+# cheaper is free. cold_workers=3 keeps three stopped workers on different hosts with the image already pulled (storage-only billing),
 # which is Vast's equivalent of a warm cache.
 set -euo pipefail
 
