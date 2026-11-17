@@ -5,7 +5,7 @@ ZONOS3-Mini TTS worker for Vast.ai Serverless (production) and RunPod Serverless
 ## Image (`slim/`)
 
 One image, `ghcr.io/olegphenomenon/zonos3-worker:runpod-slim-<sha>` (public), built by `.github/workflows/slim.yml`
-without compiling: CUDA 12.8 runtime + prebuilt `zonos3-server` (release `ggml-cuda-sm86-sm89-96d9e0e`, Ampere/Ada)
+without compiling: Ubuntu + the CUDA libraries the server links (cudart, cublas, nccl) + ffmpeg + prebuilt `zonos3-server` (release `ggml-cuda-sm86-sm89-96d9e0e`, Ampere/Ada)
 + `backbone-ptq.gguf`, `zac-keep2.gguf`, `spk-encoder.gguf` (~1.2 GB) + the voice bank clips (Opus, ~33 MB).
 Argument `vast` starts the Vast PyWorker (port 3000, route `/tts`); no argument starts the RunPod handler.
 
@@ -31,6 +31,7 @@ every Zonos language with each bank voice (`bank/refs/`, not committed). Convert
 ## Vast.ai
 
 `VAST_API_KEY=… scripts/vast_setup.sh <image tag>` creates or updates template `zonos3-tts`, endpoint `zonos3-tts`
-and its workergroup: cheap 8–24 GB Ampere/Ada cards under `VAST_MAX_DPH` (default $0.15/h); one stopped worker with
-the image already pulled is kept as the cache (`cold_workers=1`, storage-only billing); active workers stop after
-120 s without traffic.
+and its workergroup: cheap 8–24 GB Ampere/Ada cards under `VAST_MAX_DPH` (default $0.15/h); three stopped workers on
+different hosts with the image already pulled are kept as the cache (`cold_workers=3`, storage-only billing); the next
+worker wakes at 70% load (`target_util`); active workers stop after 120 s without traffic. Capacity and latency:
+`research/loadtest.py` (one RTX 4070: ~36 s of audio per second, ~20 dubbing viewers).
