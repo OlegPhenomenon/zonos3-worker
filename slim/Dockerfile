@@ -1,7 +1,7 @@
 # Slim cold-start image for RunPod and Vast: prebuilt CUDA binaries (release asset) + PTQ backbone + keep2 decoder
 # + speaker encoder + one-shot voice clips. No compiler, no PyTorch.
-# Plain Ubuntu plus only the three CUDA libraries the server links (cudart, cublas, cublasLt, ~0.8 GB) instead of the
-# full CUDA runtime image (2.8 GB): every new Vast host pulls the whole image before its first request.
+# Plain Ubuntu plus only the CUDA libraries the server links (cudart, cublas, cublasLt, nccl, ~1.2 GB) instead of the
+# full CUDA runtime image (3.1 GB): every new Vast host pulls the whole image before its first request.
 # Layers go from rarely to often changed, so a host that pulled an older tag re-downloads only the top layers.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04 AS cuda
 
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
  && rm -rf /var/lib/apt/lists/* && pip3 install --no-cache-dir -U pip && pip3 install --no-cache-dir runpod requests vastai==1.8.3
 # Named sonames are symlinks; COPY of a named symlink copies the target file under the soname.
 COPY --from=cuda /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12 /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12 \
-     /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12 /usr/local/lib/
+     /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12 /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/local/lib/
 RUN ldconfig
 COPY zonos3-ggml-cuda-sm86-89.tgz /tmp/bin.tgz
 RUN mkdir -p /app && tar xzf /tmp/bin.tgz -C /app && rm /tmp/bin.tgz
