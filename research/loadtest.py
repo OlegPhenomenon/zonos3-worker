@@ -46,7 +46,7 @@ for c in map(int, sys.argv[1:]):
                       'lat_p50': round(pct(lat, .5), 2), 'lat_p90': round(pct(lat, .9), 2), 'lat_max': round(max(lat), 2),
                       'gen_p50': round(pct(gen, .5), 2), 'gen_p90': round(pct(gen, .9), 2),
                       'audio_s_per_s': round(tput, 2), 'viewers_at_1.3x': round(tput / 1.3, 1)}), flush=True)
-rows = [json.loads(l) for l in open('/opt/zonos-proxy/requests.jsonl').read()[before:].splitlines() if l.strip()]
+rows = [json.loads(l) for l in open('/opt/zonos-proxy/requests.jsonl', 'rb').read()[before:].splitlines() if l.strip()]
 workers = {}
 for r in rows:
     w = workers.setdefault(r.get('worker'), {'n': 0, 'gpu': (r.get('gpu') or '')[:24], 'first': r['utc']})

@@ -92,12 +92,14 @@ def main():
             log.warning('%s; serving plain HTTP', e)
             os.environ['USE_SSL'] = 'false'
     from vastai.serverless.server.worker import BenchmarkConfig, HandlerConfig, Worker, WorkerConfig
-    # zonos3-server batches continuously (--batch 8 slots; a CFG request takes 2), so up to 4 requests run at once.
-    # The benchmark sends the same 4 at once: Vast scales out from the measured throughput.
+    # zonos3-server batches continuously (--batch 8 slots; a CFG request takes 2), so several requests run at once.
+    # Vast scales out from the benchmark's throughput (chars/s): warm up first (the speaker clip is encoded once) and
+    # send 8 at once, or capacity reads ~15x low (32 chars/s on an A4000 vs ~500 measured by research/loadtest.py,
+    # 2026-11-17) and a second worker starts for two viewers.
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[HandlerConfig(
         route='/tts', is_remote_dispatch=True, remote_function=tts, allow_parallel_requests=True,
         max_queue_time=600.0, workload_calculator=lambda p: float(len(p.get('text', ''))),
-        benchmark_config=BenchmarkConfig(dataset=[BENCH], runs=1, concurrency=4, do_warmup=False))])).run()
+        benchmark_config=BenchmarkConfig(dataset=[BENCH], runs=1, concurrency=8, do_warmup=True))])).run()
 
 
 if __name__ == '__main__':
