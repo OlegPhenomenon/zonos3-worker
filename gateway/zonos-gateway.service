@@ -1,0 +1,13 @@
+[Unit]
+Description=Zonos gateway for the browser extensions (license quota via Rails, synthesis on Vast)
+After=network-online.target
+
+[Service]
+# ZONOS_ENDPOINT_KEY, RAILS_STUDIO_VOICE_URL, METERING_SHARED_SECRET (mode 600)
+EnvironmentFile=/opt/zonos-gateway/env
+WorkingDirectory=/opt/zonos-gateway
+ExecStart=/usr/bin/python3 /opt/zonos-gateway/zonos_gateway.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
