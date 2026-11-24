@@ -1,5 +1,5 @@
 # Slim cold-start image for RunPod and Vast: prebuilt CUDA binaries (release asset) + PTQ backbone + keep2 decoder
-# + speaker encoder + one-shot voice clips. No compiler, no PyTorch.
+# + speaker encoder + steering bundle (emotion/style controls, 0.2 MB) + one-shot voice clips. No compiler, no PyTorch.
 # Plain Ubuntu plus only the CUDA libraries the server links (cudart, cublas, cublasLt, nccl, ~1.2 GB) instead of the
 # full CUDA runtime image (3.1 GB): every new Vast host pulls the whole image before its first request.
 # Layers go from rarely to often changed, so a host that pulled an older tag re-downloads only the top layers.
@@ -22,7 +22,7 @@ COPY zonos3-ggml-cuda-sm86-89.tgz /tmp/bin.tgz
 RUN mkdir -p /app && tar xzf /tmp/bin.tgz -C /app && rm /tmp/bin.tgz
 ARG HF=https://huggingface.co/Zyphra/ZONOS3-Mini/resolve/main/gguf
 RUN mkdir -p /app/models && cd /app/models \
- && for f in backbone-ptq.gguf zac-keep2.gguf spk-encoder.gguf; do curl -fsSL -o "$f" "$HF/$f"; done
+ && for f in backbone-ptq.gguf zac-keep2.gguf spk-encoder.gguf steer.gguf; do curl -fsSL -o "$f" "$HF/$f"; done
 ENV LD_LIBRARY_PATH=/app/build/ggml/src:/app/build/ggml/src/ggml-cuda:/app/build/ggml/src/ggml-cpu:/app/build/bin
 # Build gate: every server library resolves inside the image (libcuda.so.1 comes from the host driver at run time).
 RUN missing=$(for f in /app/build/zonos3-server $(find /app/build -name '*.so*'); do ldd "$f"; done | grep 'not found' | grep -v libcuda.so.1 | sort -u); \
@@ -32,7 +32,7 @@ COPY libzyphra_textnorm.so.gz /tmp/
 RUN mkdir -p /app/lib && gunzip -c /tmp/libzyphra_textnorm.so.gz > /app/lib/libzyphra_textnorm.so && rm /tmp/libzyphra_textnorm.so.gz
 COPY voices/ /app/voices/
 RUN ffmpeg -v error -i /app/voices/ru/Charon.ogg -f null -
-COPY common.py handler.py vast_worker.py /app/
+COPY common.py prosody.py handler.py vast_worker.py /app/
 # `vast` runs the Vast PyWorker; anything else (RunPod) the RunPod handler.
 ENTRYPOINT ["/bin/sh","-c","cd /app && if [ \"$0\" = vast ]; then exec python3 -u vast_worker.py; else exec python3 -u handler.py; fi"]
 CMD ["runpod"]

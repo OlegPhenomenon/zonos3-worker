@@ -6,6 +6,8 @@ from pathlib import Path
 
 import requests
 
+import prosody
+
 URL = 'http://127.0.0.1:1919'
 VOICES = Path('/app/voices')
 MAX_ATTEMPTS = 3          # Zonos sometimes stops early; a different seed fixes it
@@ -72,6 +74,7 @@ def keep_latin_words(text: str, nemo: str) -> str:
 
 
 _speakers = {}   # (language, voice) -> speaker id registered on this server; encoded once (~0.15 s on GPU)
+REQUEST_FIELDS = {'text', 'language', 'voice', 'reference_wav_base64', 'seed', 'params'} | prosody.FIELDS
 SESSION = {'X-TTS-Session-ID': 'bank'}
 
 
@@ -107,6 +110,11 @@ def generate(data: dict) -> dict:
         body['speaker_audio_base64'] = data['reference_wav_base64']
     if 'speaker_embedding_id' in body or 'speaker_audio_base64' in body:
         body['speaker_cfg_scale'] = 1.5  # the server refuses speaker CFG without a speaker (HTTP 400)
+    # Optional prosody (README): absent = the body above is unchanged = the old output byte for byte.
+    extra, controls = prosody.parse(data)
+    if 'speaking_rate' in extra:
+        body['condition_values'] = {**body['condition_values'], 'speaking_rate': extra.pop('speaking_rate')}
+    body.update(extra)
     # Tuning without an image rebuild: the caller (the proxy's params.json) may override these sampling fields.
     body.update({k: v for k, v in (data.get('params') or {}).items() if k in TUNABLE})
     seed = int(data.get('seed', 42))
@@ -118,6 +126,13 @@ def generate(data: dict) -> dict:
         audio_s = _duration(r.content)
         if audio_s >= len(text) / MIN_CHARS_PER_S:
             break
-    return {'wav_base64': base64.b64encode(r.content).decode(), 'audio_s': audio_s, 'attempts': attempt + 1,
-            'generation_s': time.monotonic() - t, 'model_load_s': load_s, 'gpu': gpu,
-            'text_sent': body['text'], 'text_normalization': body.get('text_normalization', True)}
+    result = {'wav_base64': base64.b64encode(r.content).decode(), 'audio_s': audio_s, 'attempts': attempt + 1,
+              'generation_s': time.monotonic() - t, 'model_load_s': load_s, 'gpu': gpu,
+              'text_sent': body['text'], 'text_normalization': body.get('text_normalization', True)}
+    if controls:
+        result['controls'] = controls          # as applied, after clamping
+    if body['condition_values']['speaking_rate'] != 22.0:
+        result['speaking_rate'] = body['condition_values']['speaking_rate']
+    if ignored := sorted(set(data) - REQUEST_FIELDS):
+        result['ignored_fields'] = ignored     # the server has no such control (e.g. pitch_std): said, not silent
+    return result
