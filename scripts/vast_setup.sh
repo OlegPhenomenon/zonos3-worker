@@ -66,7 +66,7 @@ echo "template $TEMPLATE_NAME: $IMAGE:$TAG ($template_hash)"
 
 endpoint_body() {
   jq -n --arg name "$ENDPOINT_NAME" '{
-    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 3, max_workers: 3,
+    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 3, max_workers: 6,
     target_util: 0.7, inactivity_timeout: 120, autoscaler_instance: "prod"
   }'
 }
