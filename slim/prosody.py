@@ -8,14 +8,14 @@ The server (Zyphra/ZONOS3-Mini, servers/ggml) has no `emotion` / `pitch_std` par
     (studio_bundle_mect60k_x10.json, ui.controls); the doses are raw, 0 = off.
   * `condition_values.speaking_rate` (UTF-8 bytes of text per second of speech), the condition row the worker pins at
     22.0 for uniform chunks.
-  * `steer_hold` / `steer_onset_seconds` / `steer_ramp_seconds`: the request-level controls run at full dose for the
-    first 4 s of speech, ramp over 1 s to 35% and hold that (bundle default, `steer_release`), because a constant push
-    integrates over a long line. A dubbed line is short; callers can set `steer_hold: 1` for a constant push.
-  * `controls_cfg_scale`: guidance on the hidden-space delta (1 = off).
+  * `steer_hold`: the server's "steer then hold" fade needs a `steer_release` block in steer.gguf; the published
+    steer.gguf has none, so controls are always a constant push and the server answers 400 to steer_hold < 1.
+    The worker accepts `steer_hold: 1` (a no-op, so callers may state it) and refuses anything lower.
+  * `controls_cfg_scale` cannot be combined with the speaker CFG the worker always uses (server 400): not offered.
 """
 import math
 
-RATE_RANGE = (8.0, 30.0)         # the checkpoint's rate buckets span ~9.2..30.7 bytes/s
+RATE_RANGE = (8.0, 30.0)         # the checkpoint's rate buckets' edges run 6.5..29.3 bytes/s
 
 # emotion name -> (control id, min dose, max dose, dose used when the caller sends just the name)
 EMOTIONS = {
@@ -40,8 +40,7 @@ CONTROLS = {
     'delivery.conversational': (-5.0, 5.0), 'disfluency.disfluent': (-8.0, 20.0),
     'expressive.expressive': (-16.0, 16.0),
 }
-FIELDS = {'emotion', 'controls', 'speaking_rate', 'steer_hold', 'steer_onset_seconds', 'steer_ramp_seconds',
-          'controls_cfg_scale'}
+FIELDS = {'emotion', 'controls', 'speaking_rate', 'steer_hold'}
 
 
 def _number(name: str, value) -> float:
@@ -88,8 +87,7 @@ def parse(data: dict) -> tuple[dict, dict]:
         applied = {}
     if data.get('speaking_rate') is not None:
         body['speaking_rate'] = _clamp(_number('speaking_rate', data['speaking_rate']), *RATE_RANGE)
-    for name, lo, hi in (('steer_hold', 0.0, 1.0), ('steer_onset_seconds', 0.0, 600.0), ('steer_ramp_seconds', 0.0, 600.0),
-                         ('controls_cfg_scale', 1.0, 4.0)):
-        if data.get(name) is not None and applied:   # meaningless without controls
-            body[name] = _clamp(_number(name, data[name]), lo, hi)
+    if data.get('steer_hold') is not None and _number('steer_hold', data['steer_hold']) < 1.0:
+        raise ValueError('steer_hold < 1 is not available: the steering bundle has no steer_release (controls are '
+                         'a constant push); use a lower dose instead')
     return body, applied

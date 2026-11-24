@@ -18,6 +18,14 @@ Request payload (Vast: `{"auth_data": <route answer>, "payload": {...}}`; RunPod
 | `voice` | bank voice, see `slim/voices/voices.json` (5 F, 5 M; same names in every language); cloned one-shot from `slim/voices/<code>/<voice>.ogg`, encoded once per worker |
 | `reference_wav_base64` | instead of `voice`: clone a clip. Use a clip in the target language: cross-language clones get an accent and stop early |
 | `seed` | optional |
+| `emotion` | optional: a name (`"happy"`, default dose) or `{name: dose}`. angry 0..6 (default 4), happy 0..6 (4), sad 0..8 (6), calm 0..8 (4), scared 0..14 (12), confused 0..4 (3); `valence`, `arousal` -6..6 (dose required). Doses are raw, clamped to the range; Zyphra's tested ranges are about two thirds of the maximum. Unknown name: error |
+| `controls` | optional: `{"<set>.<direction>": dose}`, clamped: `pitch.pitch`, `pitch.pitch_range` ±3; `delivery.tempo` ±3 (negative = slower), `delivery.whisper` 0..3, `delivery.loud` 0..4, `delivery.conversational` ±5; `expressive.expressive` ±16; `disfluency.disfluent` -8..20; `identity.gender`, `identity.age` ±3; `texture.deep`/`shrill`/`husky`/`raspy`/`soft`/`authoritative` 0..6; `room.clean` -4..6; the emotion ids `emotions.angry`/`happy`/`sad`/`serene`/`scared`/`confused`, `mood.valence`/`arousal`. `emotion` is sugar for these; `controls` wins on a clash. Unknown id: error |
+| `speaking_rate` | optional: UTF-8 bytes of text per second of speech, clamped 8..30 (default 22, the worker's fixed pace) |
+| `steer_hold` | optional, `1` only (a no-op). The server's fade-after-4-s needs a `steer_release` the published `steer.gguf` lacks, so controls are a constant push for the whole line; anything below 1 is an error. `controls_cfg_scale` is not offered (the server refuses it together with the speaker CFG the worker always uses) |
+
+No prosody field = the request the worker has always sent = the same audio. The model has no `pitch_std`/`emotion` parameter of its own;
+emotions are steering directions (`steer.gguf`, from Zyphra's steering bundle) that move the model's hidden state, so the effect
+differs per voice, text and seed. Other keys are ignored and named in the answer's `ignored_fields`.
 
 Answer: `{wav_base64, audio_s, attempts, generation_s, model_load_s, gpu}`. A result shorter than the text allows
 (chars / 25 s) is regenerated with the next seed, up to 3 attempts.
