@@ -13,15 +13,20 @@ ARG UBUNTU=ubuntu:22.04
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04 AS cuda
 FROM ${UBUNTU} AS cudalibs
 RUN apt-get update && apt-get install -y --no-install-recommends python3 binutils && rm -rf /var/lib/apt/lists/*
-# Named sonames are symlinks; COPY of a named symlink copies the target file under the soname.
+# Named sonames are symlinks; COPY of a named symlink copies the target file under the soname. The cuDNN engine libraries (and
+# NVRTC for the runtime-compiled ones) serve the cuDNN frontend convolutions of emotion2vec's feature encoder: without them ONNX
+# Runtime fails that Conv on CUDA and falls back to the CPU.
 COPY --from=cuda /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12 /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12 \
      /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12 /usr/local/cuda/targets/x86_64-linux/lib/libcufft.so.11 \
      /usr/local/cuda/targets/x86_64-linux/lib/libcurand.so.10 /usr/lib/x86_64-linux-gnu/libcudnn.so.9 \
      /usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_ops.so.9 \
-     /usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9 /out/
+     /usr/lib/x86_64-linux-gnu/libcudnn_heuristic.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_engines_precompiled.so.9 \
+     /usr/lib/x86_64-linux-gnu/libcudnn_engines_runtime_compiled.so.9 /usr/local/cuda/targets/x86_64-linux/lib/libnvrtc.so.12 \
+     /usr/local/cuda/targets/x86_64-linux/lib/libnvrtc-builtins.so.12.8 /out/
 COPY prune_fatbin.py /src/
 RUN python3 /src/prune_fatbin.py /out/libcublas.so.12 /out/libcublasLt.so.12 /out/libcufft.so.11 /out/libcurand.so.10 \
-      /out/libcudnn_adv.so.9 /out/libcudnn_graph.so.9 /out/libcudnn_ops.so.9 /out/libcudnn_heuristic.so.9
+      /out/libcudnn_adv.so.9 /out/libcudnn_graph.so.9 /out/libcudnn_ops.so.9 /out/libcudnn_heuristic.so.9 \
+      /out/libcudnn_engines_precompiled.so.9
 
 # ---------------------------------------------------------------- Python dependencies (build only)
 FROM ${UBUNTU} AS pydeps

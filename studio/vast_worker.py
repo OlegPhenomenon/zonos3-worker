@@ -332,7 +332,7 @@ def mix_piece_blocking(p: dict) -> dict:
     if start_s < 0 or rate not in (44100, 48000) or not 0 < frames <= MAX_PIECE_S * rate or 'report' not in summary:
         raise Fail('bad_request', f'need startS >= 0, rate 44100|48000, 0 < frames <= {MAX_PIECE_S} s, a summary with report')
     t0 = time.time()
-    with using(d.name):
+    with using(d.name), _mix_slots:
         tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='piece-'))
         try:
             clip = tmp / 'data' / 'exp' / 'piece'
@@ -391,9 +391,11 @@ def load_separator():
     sys.path.insert(0, str(LAB))
     from emotion_ser import Ser
     _ser = Ser()  # E2V_ONNX: the emotion2vec+ large ONNX model in the image
-    if 'CUDAExecutionProvider' not in _ser.sess.get_providers():
-        raise RuntimeError(f'emotion model: CUDA provider not active: {_ser.sess.get_providers()}')
     probs = _ser.probs_pcm(noise[0, :16000 * 3])
+    # ONNX Runtime falls back to the CPU on a failing CUDA node (seen without the cuDNN engine libraries) and keeps answering:
+    # checked after the first run, so a worker never serves the emotion model from the CPU.
+    if _ser.sess.get_providers()[0] != 'CUDAExecutionProvider':
+        raise RuntimeError(f'emotion model: not on CUDA after the first run: {_ser.sess.get_providers()}')
     if not all(math.isfinite(v) for v in probs.values()):
         raise RuntimeError('emotion model returns non-finite output on this GPU')
     log.info('emotion model ready in %.1f s', time.time() - t)
