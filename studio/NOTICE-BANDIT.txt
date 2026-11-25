@@ -1,0 +1,11 @@
+Dialogue separation model
+
+bandit_speech.onnx is the speech branch of the Bandit v2 cinematic audio source separation model, converted to ONNX
+(studio/tool/export_bandit.py) from the official multilingual checkpoint without retraining.
+
+  Model:   Karn N. Watcharasupat, Chih-Wei Wu, Iroro Orife, "Remastering Divide and Remaster: A Cinematic Audio Source
+           Separation Dataset with Multilingual Support", arXiv:2407.07275.
+  Weights: checkpoint-multi.ckpt, Zenodo 10.5281/zenodo.12701995, license CC BY-SA 4.0
+           (https://creativecommons.org/licenses/by-sa/4.0/). The converted file is an adaptation and is redistributed under the
+           same license (CC BY-SA 4.0); nothing in this image restricts the rights that license grants.
+  Code:    https://github.com/kwatcharasupat/bandit-v2, Apache License 2.0 (src/models/bandit is the architecture the export traces).

@@ -1,0 +1,8 @@
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+praat-parselmouth==0.4.5
+onnxruntime-gpu==1.23.2
+requests
+cryptography
+vastai==1.8.3
