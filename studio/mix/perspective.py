@@ -14,7 +14,7 @@ import numpy as np
 import scipy.fft as sfft
 from concurrent.futures import ThreadPoolExecutor
 
-from .core import FR, SR, frame_power
+from .core import FR, SR, frame_power, read_range
 
 # ----------------------------------------------------------------------------- constants (lab values; seconds / Hz carry over)
 FRAME_WIN = 1024  # 21 ms window (the lab's 1024 samples at 44.1 kHz were 23 ms): resolves the 60-300 ms decay window, bin 47 Hz
@@ -317,13 +317,14 @@ def part_cue(clip, doc, start_s, end_s, next_start_s=None):
     """Cue of one part measured on the speech stem inside its original slot [start_s, end_s] (decay events are searched up to
     next_start_s, at most TAIL_AFTER_S past the slot). Returns {'wet_db', 'tilt_db', 'pan_db_track': [[t_rel_s, bal_db], ...]};
     wet_db > 0 = more reverberant than the scene's neutral, tilt_db > 0 = brighter, pan bal_db = 10log10(L / R)."""
-    stem = clip.speech2
-    nfr = stem.shape[1] // FR
+    nfr = clip.n // FR
     i0, i1, iR = _slot_frames(start_s, end_s, next_start_s, nfr)
     sc = _scene_of(doc["scenes"], 0.5 * (start_s + end_s))
     fl = doc["floors"][sc]
     f0 = max(0, i0 - int(PRE_S * 100))
-    F = features(stem, f0, iR)
+    base = max(0, f0 - 3)  # read only the samples the frames f0..iR touch (the stem of a 10-min clip is 230 MB)
+    stem = read_range(clip.dir / "speech.flac", base * FR, (iR + 3) * FR, 2)
+    F = features(stem, f0 - base, iR - base)
     meas = _measure_slot(F, i0 - f0, i1 - f0, iR - f0, fl)
     raw_wet, m_wet, _, raw_tilt, m_tilt, _ = _raw_values(meas)
     neu = doc["scene_neutral"][sc]

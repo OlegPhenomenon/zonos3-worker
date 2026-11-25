@@ -31,6 +31,7 @@ Differences from the lab: analysis at 48 kHz (FFT 4096 / hop 2048 samples = 85 /
 23), FFTs only for frames inside speech regions (the others are never read), no shot cuts / speaker labels.
 """
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.fft as sfft
@@ -44,7 +45,7 @@ WINDOW_SPEECH_S = 8.0  # resolution of audio-only change points: atom size in sp
 ALPHA = 0.05  # family-wise false-split probability over all candidate boundaries (Bonferroni)
 BAND_Z = 3.0  # band is lost when its signature is this many noise sigmas below 0 (one-sided p = 0.0013 ~ ALPHA / 23 bands)
 CHI2_MEDIAN_1 = 0.4549  # median of chi2 with 1 dof
-CHUNK = 512  # frames per FFT batch
+CHUNK = 128  # frames per FFT batch (one thread task)
 
 
 # ----------------------------------------------------------------------------- features
@@ -77,10 +78,14 @@ def band_power(x, speech, sr, workers):
     P = np.zeros((n, len(c)), np.float64)
     idx = np.flatnonzero(speech)
     view = np.lib.stride_tricks.sliding_window_view(x, NFFT)[::HOP]
-    for s0 in range(0, len(idx), CHUNK):
+
+    def run(s0):
         sel = idx[s0:s0 + CHUNK]
-        X = sfft.rfft(view[sel] * win, axis=1, workers=workers)[:, k0:]
+        X = sfft.rfft(view[sel] * win, axis=1)[:, k0:]
         P[sel] = (X.real * X.real + X.imag * X.imag) @ B
+
+    with ThreadPoolExecutor(max(1, workers)) as ex:  # FFT, gather and matmul release the GIL; chunks write disjoint rows
+        list(ex.map(run, range(0, len(idx), CHUNK)))
     return P
 
 

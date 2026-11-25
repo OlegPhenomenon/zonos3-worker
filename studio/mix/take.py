@@ -8,7 +8,7 @@ import io
 import numpy as np
 import parselmouth
 import soundfile as sf
-from parselmouth.praat import call
+from parselmouth.praat import call, run
 from scipy.signal import resample_poly
 
 from .core import SR
@@ -44,6 +44,7 @@ def trim_silence(x):
 def psola(x, tempo, sr=SR):
     """Time-scale mono float audio by `tempo` (2.0 = twice as fast) keeping pitch and formants. The pitch range is taken from the
     take itself, so female and male voices both get right pitch marks."""
+    run("random_initializeWithSeedUnsafelyButPredictably (1)")  # Praat's overlap-add draws random numbers: make the take reproducible
     snd = parselmouth.Sound(x.astype(np.float64), sampling_frequency=sr)
     f0 = snd.to_pitch(0.01, 60, 600).selected_array["frequency"]
     f0 = f0[f0 > 0]

@@ -6,7 +6,7 @@ A part is {"o0","o1": original slot, "d0","d1": placed dub span, "err": dub end 
 """
 import numpy as np
 
-from .core import FR, SR, level_db
+from .core import FR, level_db
 
 SEG_S = 1.0  # level is followed per ~1 s of a part
 LEVEL_CLAMP_DB = 6.0  # per-segment gain may differ from the window's median gain by at most this

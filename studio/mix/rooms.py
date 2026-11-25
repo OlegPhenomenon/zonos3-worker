@@ -8,7 +8,9 @@ scene of the channel document:
    quantile over events, stationary ambient removed), plus the anchor-free `nominal` version (time origin = the slot end).
 2. Two-component model per octave band fitted by analysis by synthesis against the dry reference voice `core.reference()`
    (the product has no dub when the clip is analysed): simulate = reference voice * (delta + early + late), measure the same
-   statistics, move the parameters until they equal the stem's. late: diffuse noise (level at T_REF_L_S, slope); early: sparse
+   statistics, move the parameters until they equal the stem's. The reference is used as a pack of REF_EVENTS isolated events
+   (the last REF_LEAD_S of a reference region + REF_PAUSE_S of digital silence, each convolved on its own): the reference's own pauses
+   are too short for the long-tau points, and the pack keeps one simulation at ~25 ms. late: diffuse noise (level at T_REF_L_S, slope); early: sparse
    taps 5..100 ms = the late exponential continued back (prior) whose level is moved only when the data object strongly.
 3. M&E cross-check: decay events of the background stem (broadband level falls >= 12 dB within 50 ms after a 150 ms plateau); the
    low quartile of the per-band RT60 over events is the room estimate of the M&E.
@@ -118,12 +120,12 @@ def env_db(x, frames=None, workers=1, chunk=4096):
         x = np.pad(x, (0, cm.ENV_WIN - len(x)))
     nfr = (len(x) - cm.ENV_WIN) // hop + 1
     view = np.lib.stride_tricks.sliding_window_view(x, cm.ENV_WIN)[::hop]
-    idx = np.arange(nfr) if frames is None else np.asarray(frames)
-    out = np.empty((len(idx), NB), np.float32)
-    for s0 in range(0, len(idx), chunk):
-        blk = view[idx[s0:s0 + chunk]] * win
-        spec = sfft.rfft(blk, axis=1, workers=workers)
-        p = spec.real ** 2 + spec.imag ** 2
+    n_out = nfr if frames is None else len(frames)
+    out = np.empty((n_out, NB), np.float32)
+    for s0 in range(0, n_out, chunk):
+        blk = (view[s0:s0 + chunk] if frames is None else view[np.asarray(frames[s0:s0 + chunk])]) * win
+        p = np.abs(sfft.rfft(blk, axis=1, workers=workers, overwrite_x=True))
+        p *= p
         out[s0:s0 + len(blk)] = 10 * np.log10(p @ w + 1e-20)
     return out
 
@@ -237,9 +239,11 @@ def late_length(slopes):
     return float(np.clip(1.3 * max(rts), 0.25, LATE_BANK_S)) if rts else 0.0
 
 
-def mono_ir(bank, early, late, c=0):
-    """delta + early + late of channel c (the fit's simulation IR), float32."""
+def mono_ir(bank, early, late, c=0, cap_s=None):
+    """delta + early + late of channel c (the fit's simulation IR), float32. cap_s: longest IR the caller can observe (s)."""
     ln = late_length(late[1]) if any(v is not None for v in late[1]) else 0.0
+    if cap_s is not None:
+        ln = min(ln, cap_s)
     n = max(int(ln * bank.sr), int(T_E1_S * bank.sr) + 1)
     h = np.zeros(n)
     h[0] = 1.0
@@ -304,8 +308,9 @@ def _event_frames(Y, rows, cols, workers=1):
     w, win, hop = _env_tables()
     view = np.lib.stride_tricks.sliding_window_view(Y, cm.ENV_WIN, axis=1)  # (N, L - win + 1, win)
     blk = view[rows.ravel(), cols.ravel() * hop] * win
-    spec = sfft.rfft(blk, axis=1, workers=workers)
-    out = 10 * np.log10((spec.real ** 2 + spec.imag ** 2) @ w + 1e-20)
+    p = np.abs(sfft.rfft(blk, axis=1, workers=workers, overwrite_x=True))
+    p *= p
+    out = 10 * np.log10(p @ w + 1e-20)
     return out.reshape(*cols.shape, NB).astype(np.float64)
 
 
@@ -400,11 +405,13 @@ def voice_stats(db, sreg):
             "nom": {"stat": cm.minus_ambient(nstat, nfloor_rel), "se": np.where(np.isfinite(nse), nse, 1.0), "cnt": ncnt, "floor_rel": nfloor_rel}}
 
 
-def fit_layers(ref, rs, bank, late_fixed=None, early_on=True, threads=1):
+def fit_layers(ref, rs, bank, late_fixed=None, early_on=True, threads=1, start=None):
     """Analysis by synthesis of the two-layer model against a reference decay statistic.
     ref = voice_stats() (or an M&E curve in the same format, without "nom"); rs = reference_sim(). late_fixed = per-band slopes (None
     where no tail) to fit only the late LEVELS with these slopes (M&E / blend rule); early_on=False skips the early layer.
     Cost of a candidate = squared error of the anchored curve (all taus of the layer) + of the nominal-end curve (when ref has "nom").
+    start = per-band late levels (dB at T_REF_L_S) of an earlier, single-layer fit of the same stem (channel.estimate): when every
+    active band has one, the first level search covers start +-12 dB (7 simulations) instead of -60 .. -20 dB (16).
     threads > 1 evaluates the independent candidates of a level search on that many threads (FFT and BLAS release the GIL).
     Returns dict(early=(levels, slopes), late=(levels, slopes), info_early, info_late, n_sims, final, valid)."""
     stat, se, cnt, floor_rel = ref["stat"], ref["se"], ref["cnt"], ref["floor_rel"]
@@ -424,7 +431,7 @@ def fit_layers(ref, rs, bank, late_fixed=None, early_on=True, threads=1):
 
     def simulate(early, late):
         n_sims[0] += 1
-        ev, nevc = sim_events(ref_through(rs, mono_ir(bank, early, late)), rs["end_s"])
+        ev, nevc = sim_events(ref_through(rs, mono_ir(bank, early, late, cap_s=rs["n_total"] / SR)), rs["end_s"])
         sim = np.maximum(cm.decay_stat(ev)[0], floor_rel[None, :])  # below the stem's ambient nothing can be observed
         sim_n = None
         if nom is not None:
@@ -506,6 +513,10 @@ def fit_layers(ref, rs, bank, late_fixed=None, early_on=True, threads=1):
             l_lv[b] = -60.0
     mk_l = lambda lv: (none_e, (lv, l_sl))
     if active_l:
+        if late_fixed is None and start is not None and all(start[b] is not None for b in active_l):
+            for b in active_l:
+                l_lv[b] = float(start[b])
+            grid0 = np.arange(-12.0, 12.1, 4.0)
         level_search(active_l, l_lv, l_sl, LATE_TAUS, grid0, mk_l)
         if late_fixed is None:
             for step in (2.0, 1.0, 1.0):
@@ -585,15 +596,16 @@ def me_env(bg_mono, workers):
     nfr = len(bb)
     cand = np.zeros(nfr, bool)
     if nfr > plat + fall + 2:
-        win = np.lib.stride_tricks.sliding_window_view(bb, plat + 1)  # win[j] = bb[j:j+plat+1]; plateau of a = j + plat
-        lv = np.lib.stride_tricks.sliding_window_view(live, plat + 1)
-        pre = np.median(win, axis=1)
-        wmin = win.min(axis=1)
-        ok_live = lv.all(axis=1)
-        i = np.arange(plat + fall, nfr)  # i - fall - plat >= 0
-        j = i - fall - plat
+        # i qualifies only if bb[i] <= bb[a] - 6 (bb[a] >= pre - 6 and bb[i] <= pre - 12): the rolling median is taken on those only
+        i = np.arange(plat + fall, nfr)
         a = i - fall
-        cand[i] = ((wmin[j] >= bb_floor + ME_ABOVE_FLOOR_DB) & (bb[a] >= pre[j] - ME_PLATEAU_FLAT_DB) & (bb[i] <= pre[j] - ME_FALL_DB) & ok_live[j])
+        pre_ok = bb[i] <= bb[a] - (ME_FALL_DB - ME_PLATEAU_FLAT_DB)
+        i, a = i[pre_ok], a[pre_ok]
+        j = a - plat
+        lv = np.lib.stride_tricks.sliding_window_view(live, plat + 1)[j].all(axis=1)
+        win = np.lib.stride_tricks.sliding_window_view(bb, plat + 1)[j]  # bb[a - plat : a + 1]
+        pre = np.median(win, axis=1)
+        cand[i] = ((win.min(axis=1) >= bb_floor + ME_ABOVE_FLOOR_DB) & (bb[a] >= pre - ME_PLATEAU_FLAT_DB) & (bb[i] <= pre - ME_FALL_DB) & lv)
     return {"db": db, "live": live, "floor": floor, "bb": bb, "bb_floor": bb_floor, "cand": np.flatnonzero(cand)}
 
 
@@ -733,7 +745,7 @@ def decide(vinfo_l, vinfo_e, v_events, me, voice_dry):
     me_slopes = None
     if me_ok:
         me_slopes = [-60.0 / (me["by_band"][b] if me["by_band"][b] is not None else me["rt60"]) for b in range(NB)]
-    if any_good and me_ok:
+    if any_good and good_rt is not None and me_ok:  # good bands outside RT_BANDS leave the median empty: the voice alone decides
         ratio = max(good_rt, me["rt60"]) / min(good_rt, me["rt60"])
         out["ratio"] = ratio
         if ratio <= AGREE_RATIO:
@@ -788,9 +800,8 @@ def build_room(bank, late_params, early_params, source_none=False):
     return early.astype(np.float32), late.astype(np.float32)
 
 
-def tone_fir(p_stem, p_noise, early, late):
-    """channel_match.estimate_scene's tone FIR with the room applied: stem LTAS over the LTAS of the reference voice through
-    delta + room, noise-subtracted. p_stem / p_noise: the scene's cm.ltas / cm.noise_psd power spectra."""
+def dub_ltas(early, late):
+    """LTAS of the dry reference voice through delta + room (channel 0 of the layers): the dub side of the tone FIR."""
     if "tone" not in _REF:
         _REF["tone"] = core.reference().excerpt(TONE_REF_S)
     x, regs = _REF["tone"]
@@ -798,7 +809,13 @@ def tone_fir(p_stem, p_noise, early, late):
     h[0] = 1.0
     h[:early.shape[1]] += early[0]
     h[:late.shape[1]] += late[0]
-    p_dub, _ = cm.ltas(cm.conv(x, h), regs)
+    with threadpool_limits(1):
+        return cm.ltas(cm.conv(x, h), regs)[0]
+
+
+def tone_fir(p_stem, p_noise, p_dub):
+    """channel_match.estimate_scene's tone FIR with the room applied: stem LTAS over the LTAS of the reference voice through
+    delta + room (dub_ltas), noise-subtracted. p_stem / p_noise: the scene's cm.ltas / cm.noise_psd power spectra."""
     fir, _, _ = cm.eq_filter(p_stem, p_dub, SR, p_noise=p_noise)
     return fir.astype(np.float32)
 
@@ -909,11 +926,21 @@ def _stats_job(i):
         return out
     i0, i1 = int(t0 * SR), min(int(t1 * SR), g["n"])
     sseg = g["stem"][i0:i1]
-    with threadpool_limits(1):
-        out["vs"] = voice_stats(g["stem_db"][f0:f1], sreg)
-        out["p_stem"], _ = cm.ltas(sseg, [(a - t0, b - t0) for a, b in cm.window_regions(g["regions"], t0, t1)], SR)
-        out["p_noise"] = cm.noise_psd(sseg, SR)
+    with threadpool_limits(1), ThreadPoolExecutor(3) as ex:  # the three are independent and mostly FFT / sorting (GIL released)
+        f_vs = ex.submit(voice_stats, g["stem_db"][f0:f1], sreg)
+        f_ltas = ex.submit(cm.ltas, sseg, [(a - t0, b - t0) for a, b in cm.window_regions(g["regions"], t0, t1)], SR)
+        f_noise = ex.submit(cm.noise_psd, sseg, SR)
+        out["vs"], out["p_stem"], out["p_noise"] = f_vs.result(), f_ltas.result()[0], f_noise.result()
     return out
+
+
+def _start_levels(sc):
+    """Late levels at T_REF_L_S from the channel document's single-layer tail of the scene (level at its T_REF_S on the same
+    exponential), None per band without a tail; None when the scene carries no tail."""
+    lv, sl = sc.get("levels"), sc.get("slopes")
+    if not lv or not sl:
+        return None
+    return [None if a is None or b is None else a + b * (T_REF_L_S - cm.T_REF_S) for a, b in zip(lv, sl)]
 
 
 def _fit_job(args):
@@ -922,11 +949,15 @@ def _fit_job(args):
     g = _G
     res = {"me": st["me"], "me_res": st["me_res"], "rs": g["rs"], "vs": st["vs"]}
     with threadpool_limits(1):
-        res["fit"] = None if not cm.enough_events(st["vs"]["cnt"]) else fit_layers(st["vs"], g["rs"], g["bank"], threads=threads)
+        res["fit"] = None if not cm.enough_events(st["vs"]["cnt"]) else fit_layers(st["vs"], g["rs"], g["bank"], threads=threads, start=_start_levels(g["scenes"][i]))
         return scene_record(g["scenes"][i], res, g["bank"], threads)
 
 
 # ----------------------------------------------------------------------------- clip level
+
+def _dub_ltas_job(room):
+    return dub_ltas(*room)
+
 
 def analyze(clip, chan, regions, workers=8, tone=None):
     """See the module docstring."""
@@ -935,6 +966,7 @@ def analyze(clip, chan, regions, workers=8, tone=None):
     stem = clip.speech
     _G.update(scenes=scenes, n=clip.n, stem=stem, regions=regions, bank=get_bank(rho), rs=reference_sim(),
               stem_db=env_db_parallel(stem, workers), me_env=me_env(clip.bg2.mean(0), workers))
+    dub_ltas(np.zeros((2, 1), np.float32), np.zeros((2, 1), np.float32))  # loads the reference excerpt before the fork
     ctx = mp.get_context("fork")
     with ProcessPoolExecutor(max(1, min(workers, len(scenes))), mp_context=ctx) as ex:
         stats = list(ex.map(_stats_job, range(len(scenes))))
@@ -942,31 +974,39 @@ def analyze(clip, chan, regions, workers=8, tone=None):
         n_fit = sum(1 for i in todo if cm.enough_events(stats[i]["vs"]["cnt"])) or 1
         threads = max(1, workers // min(workers, n_fit))  # the candidates of a level search use the cores the scene processes leave free
         fits = dict(zip(todo, ex.map(_fit_job, [(i, stats[i], threads) for i in todo])))
+        ents = _donor_rule(scenes, stats, fits)
+        rooms_ = {}  # unique rooms (by the scene that owns the arrays) -> LTAS of the reference through them
+        for e in ents.values():
+            if not e["few"]:
+                rooms_.setdefault(e["room"], (e["early"], e["late"]))
+        keys = list(rooms_)
+        p_dub = dict(zip(keys, ex.map(_dub_ltas_job, [rooms_[k] for k in keys])))
     _G.clear()
-    results = []
-    for i, (sc, st) in enumerate(zip(scenes, stats)):
-        if st["few"]:
-            rec, _, _, _ = empty_record(sc, st["me"])
-            results.append({"rec": rec, "early": None, "late": None, "few": True})
-        else:
-            rec, early, late = fits[i]
-            results.append({"rec": rec, "early": early, "late": late, "few": False, "p_stem": st["p_stem"], "p_noise": st["p_noise"]})
-    return _finish(scenes, results, rho)
+    ident = np.zeros(EQ_TAPS, np.float32)
+    ident[0] = 1.0
+    for e in ents.values():
+        e["fir"] = ident if e["few"] else tone_fir(e["p_stem"], e["p_noise"], p_dub[e["room"]])
+    for sc in scenes:  # a scene with fewer than 2 speech regions that borrowed a room takes the donor's tone filter too
+        e = ents[sc["id"]]
+        if e["few"] and e["rec"]["borrowed_from"] is not None:
+            e["fir"] = ents[e["rec"]["borrowed_from"]]["fir"]
+    return {"sr": SR, "floor_coherence": None if rho is None else [float(v) for v in rho],
+            "scenes": [dict(ents[sc["id"]]["rec"], _fir=ents[sc["id"]]["fir"], _early=ents[sc["id"]]["early"], _late=ents[sc["id"]]["late"]) for sc in scenes]}
 
 
-def _finish(scenes, results, rho):
-    """Donor rule + tone FIRs + the document (module docstring)."""
+def _donor_rule(scenes, stats, fits):
+    """Entries {scene id: dict(rec, early, late, few, room (id of the scene that owns the room arrays), p_stem, p_noise)}.
+    A scene with no evidence of its own (source none and < MIN_EVENTS voice events) takes the ROOM of its channel-document donor; a
+    donor that has no evidence of its own either passes the request on to ITS donor (chains end at a scene with evidence)."""
     ents = {}
-    for sc, r in zip(scenes, results):
-        rec = r["rec"]
-        if r["few"]:
-            ident = np.zeros(EQ_TAPS, np.float32)
-            ident[0] = 1.0
-            ents[sc["id"]] = dict(r, fir=ident, early=np.zeros((2, 1), np.float32), late=np.zeros((2, 1), np.float32))
+    for k, (sc, st) in enumerate(zip(scenes, stats)):
+        i = sc["id"]
+        if st["few"]:
+            rec, _, none, _ = empty_record(sc, st["me"])
+            ents[i] = {"rec": rec, "early": none, "late": none, "few": True, "room": i}
         else:
-            ents[sc["id"]] = dict(r, fir=tone_fir(r["p_stem"], r["p_noise"], r["early"], r["late"]))
-    # A scene with no evidence of its own (source none and < MIN_EVENTS voice events) takes the ROOM of its channel-document donor; a
-    # donor that has no evidence of its own either passes the request on to ITS donor (chains end at a scene with evidence).
+            rec, early, late = fits[k]
+            ents[i] = {"rec": rec, "early": early, "late": late, "few": False, "room": i, "p_stem": st["p_stem"], "p_noise": st["p_noise"]}
     own = {i: not (e["rec"]["source"] == "none" and e["rec"].get("voice_events", 0) < MIN_EVENTS) for i, e in ents.items()}
     donor_id = {sc["id"]: sc.get("borrowed_from") for sc in scenes}
     base = {i: dict(e) for i, e in ents.items()}
@@ -986,10 +1026,5 @@ def _finish(scenes, results, rho):
         e["rec"] = dict(drec, id=i, start=sc["start"], end=sc["end"], borrowed_from=cur, voice_rt60_s=None, voice_plausible=False, voice_reasons=[],
                         agreement="no evidence", agreement_ratio=None, n_sims=0, **keep,
                         note=f"no evidence of its own: room of scene {cur} ({drec['source']}: {drec['note']})")
-        e["early"], e["late"] = base[cur]["early"], base[cur]["late"]
-        e["fir"] = base[cur]["fir"] if e["few"] else tone_fir(e["p_stem"], e["p_noise"], e["early"], e["late"])
-    out = []
-    for sc in scenes:
-        e = ents[sc["id"]]
-        out.append(dict(e["rec"], _fir=e["fir"], _early=e["early"], _late=e["late"]))
-    return {"sr": SR, "floor_coherence": None if rho is None else [float(v) for v in rho], "scenes": out}
+        e["early"], e["late"], e["room"] = base[cur]["early"], base[cur]["late"], base[cur]["room"]
+    return ents

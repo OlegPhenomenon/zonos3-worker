@@ -7,7 +7,6 @@ and the room tone, and mastered. Everything is computed on the window plus ROLL_
 that ended before the window are rung out because the caller passes those parts; limiter, dynamics and level memories are shorter
 than the roll), the context is cropped, so adjacent windows join.
 """
-import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp

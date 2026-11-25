@@ -29,6 +29,10 @@ Method (unchanged from the lab, see channel_match.py)
 Scenes with too little evidence of their own borrow the tail of the most similar scene that has enough (the tone stays their own);
 scenes without regions take the whole channel of the most similar scene.
 
+Parallelism: a persistent forkserver pool of `workers` processes (`prepare(workers)` starts it; the stem is shared memory), the scenes'
+work is a task graph (envelope slices -> decay statistics -> tail fit -> tone / IR -> dynamics fit; stem spectra and the dereverberated
+chunks run beside the tail fit), so a clip with one long scene still uses all workers.
+
 Differences from the lab (all measured, see the hand-off report): 48 kHz; the reference voice replaces the dub; the tail fit uses
 the linearity of the simulation in the tail level (one convolution per slope set instead of one per level candidate); band
 envelopes use FFT 1024 / hop 240 samples (21 ms / 5 ms); dynamics.py explains its own changes.
@@ -36,7 +40,8 @@ envelopes use FFT 1024 / hop 240 samples (21 ms / 5 ms); dynamics.py explains it
 import math
 import multiprocessing as mp
 import warnings
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from multiprocessing import shared_memory
 
 import numpy as np
 import scipy.fft as sfft
@@ -666,102 +671,133 @@ def dynamics_chunks(sreg, dur, budget_s):
     return [(cut[f], cut[l + 1]) for f, l in merged]
 
 
-def fit_scene_dynamics(seg, sreg, fir):
-    """Dynamics of a scene: the stem segment `seg` (mono, 48 kHz) with regions `sreg` (s, relative to seg) and its tone filter
-    `fir`. y = fir * dereverberated stem on the chunks of dynamics_chunks, s = the stem there; both concatenated."""
-    ys, ss, spans = [], [], []
-    off = 0.0
-    for a, b in dynamics_chunks(sreg, len(seg) / SR, dynamics.FIT_BUDGET_S):
-        x = seg[int(a * SR):int(b * SR)]
-        ys.append(fftconvolve(dereverb(x), fir.astype(np.float32))[:len(x)].astype(np.float32))
-        ss.append(np.asarray(x, np.float32))
+def dynamics_inputs(sreg, dur, pieces):
+    """Spans (s, on the concatenated time line) of the regions inside the stretches `pieces` [(a, b)] of a scene."""
+    spans, off = [], 0.0
+    for a, b in pieces:
         spans += [(ra - a + off, rb - a + off) for ra, rb in sreg if ra >= a and rb <= b]
-        off += len(x) / SR
+        off += int(b * SR) / SR - int(a * SR) / SR
+    return spans
+
+
+def fit_chunk_dynamics(stem_chunks, derev_chunks, spans, fir):
+    """Dynamics from the stem chunks (s) and their dereverberated copies (y = fir * dereverberated stem), concatenated, with the
+    regions `spans` of the concatenation."""
+    ys = [fftconvolve(d, fir.astype(np.float32))[:len(d)].astype(np.float32) for d in derev_chunks]
     ref_sig, ref_regs = core.reference().excerpt(20.0)
     x_ref = (fftconvolve(ref_sig, fir.astype(np.float32))[:len(ref_sig)].astype(np.float32), ref_regs)
-    return dynamics.fit_dynamics(np.concatenate(ys), np.concatenate(ss), spans, SR, x_ref=x_ref)
+    return dynamics.fit_dynamics(np.concatenate(ys), np.concatenate([np.asarray(c, np.float32) for c in stem_chunks]), spans, SR, x_ref=x_ref)
 
 
-# ----------------------------------------------------------------------------- one scene
+# ----------------------------------------------------------------------------- worker tasks (run in the pool processes)
+# The pool is persistent and started with forkserver (the analysis runs other stages in threads of the parent: no fork of a
+# multithreaded process). The stem travels as shared memory; every task reads its slice of it by sample range.
 
-class _Ctx:
-    """Everything the pool workers read (set before fork)."""
-    clip = None
-    regions = None
-    scenes = None
+_ATTACHED = {}
 
 
-def _tone(clip_seg, sreg, tail):
-    """Tone filter of a scene for a given tail signal (no direct pulse): (fir, eq_db, p_dub, n_s, n_d). The reference excerpt is
-    passed through the tail."""
-    ref = _ref()
-    p_stem, n_s = ltas(clip_seg, sreg)
-    p_dub, n_d = ltas(ref.tail_signal(tail) + ref.sig, ref.regions)  # the tone filter only has to close what the tail leaves open
-    fir, g_db, f = eq_filter(p_stem, p_dub, SR, p_noise=noise_psd(clip_seg))
-    return fir, g_db, p_dub, n_s, n_d
+def _attach(name, n):
+    """The shared mono stem (float32, n samples) of the current estimate, mapped once per worker."""
+    if _ATTACHED.get("name") != name:
+        if "shm" in _ATTACHED:
+            _ATTACHED["arr"] = None
+            _ATTACHED["shm"].close()
+        shm = shared_memory.SharedMemory(name=name)
+        _ATTACHED.update(name=name, shm=shm, arr=np.ndarray((n,), np.float32, buffer=shm.buf))
+    return _ATTACHED["arr"]
 
 
-def _stem_evidence(i):
-    """Decay statistics of scene i of the stem: dict(sreg, stat, cnt, ev, floor_rel) or None when it has < 2 regions."""
-    sc = _Ctx.scenes[i]
-    t0, t1 = sc["start"], sc["end"]
-    sreg = [(a - t0, b - t0) for a, b in window_regions(_Ctx.regions, t0, t1)]
-    if sc["speech_s"] <= 0 or len(sreg) < 2:
-        return None
-    seg = _Ctx.clip.speech[int(t0 * SR):int(t1 * SR)]
-    ev, pre, floor = decay_curves(band_env_db(seg), sreg)
+def _t_env(name, n, i0, i1, fw):
+    with sfft.set_workers(fw):
+        return band_env_db(_attach(name, n)[i0:i1])
+
+
+def _t_spectra(name, n, i0, i1, sreg):
+    """Stem long-term spectrum inside the regions and its stationary noise spectrum (independent of the tail)."""
+    seg = _attach(name, n)[i0:i1]
+    p_stem, n_s = ltas(seg, sreg)
+    return p_stem, n_s, noise_psd(seg)
+
+
+def _t_dereverb(name, n, i0, i1):
+    return dereverb(_attach(name, n)[i0:i1])
+
+
+def _t_evidence(db, sreg):
+    """Decay statistics of a scene from its band envelope."""
+    ev, pre, floor = decay_curves(db, sreg)
     stat, cnt = decay_stat(ev)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)  # a band that is never above its floor has no pre-level at all
         floor_rel = floor - np.nanmedian(pre, axis=0)
-    return {"seg": seg, "sreg": sreg, "stat": stat, "cnt": cnt, "ev": ev, "floor_rel": floor_rel}
+    return {"stat": stat, "cnt": cnt, "ev": ev, "floor_rel": floor_rel}
 
 
-def _finish(i, evid, tail):
-    """Scene record of scene i from its stem evidence and a tail (levels, slopes, info): tone, IR, reports, dynamics."""
-    levels, slopes, info = tail
-    length = tail_length(slopes)
-    tail = synth_tail(levels, slopes, length)
-    tail_ir = tail.copy()
-    tail_ir[0] += 1.0
-    fir, g_db, p_dub, n_s, n_d = _tone(evid["seg"], evid["sreg"], tail)
-    h = fftconvolve(fir.astype(np.float32), tail_ir)
-    h = h.astype(np.float32)
-    energy = float(np.sum(tail_ir[1:].astype(np.float64) ** 2))
-    return {"h": h, "fir": fir.astype(np.float32), "dynamics": fit_scene_dynamics(evid["seg"], evid["sreg"], fir), "tail": info, "levels": levels, "slopes": slopes, "eq_db": g_db, "p_dub": p_dub,
-            "model_drr_db": None if energy <= 0 else round(-10 * math.log10(energy), 1), "n_events": len(evid["sreg"]),
-            "report": {**ir_report(h), "band_rt60_s": band_rt60(h), "eq_edges": eq_edges(g_db, p_dub)}}
+def _t_fit(evid, fw):
+    """Tail of a scene (levels, slopes, info) from its decay statistics."""
+    with sfft.set_workers(fw), threadpool_limits(fw):
+        se = decay_stat_se(evid["ev"])
+        return fit_tail(minus_ambient(evid["stat"], evid["floor_rel"]), se, evid["cnt"], evid["floor_rel"])
 
 
-def _task_own(i):
-    """Round 1: scene i alone. Returns (i, evidence summary, record or None). The record is only built when the scene has
-    enough events to be judged by itself."""
-    evid = _stem_evidence(i)
-    if evid is None:
-        return i, None, None
-    good = enough_events(evid["cnt"])
-    rec = None
-    if good:
-        rec = _own_record(evid)
-    return i, {"good": good, "cnt": evid["cnt"]}, rec
+def _t_tone(tail, p_stem, p_noise, borrowed, fw):
+    """Tone filter, IR and reports of a scene for a tail: dict(h, fir, eq_db, p_dub, model_drr_db, report)."""
+    levels, slopes, _ = tail
+    ref = _ref()
+    with sfft.set_workers(fw):
+        tl = synth_tail(levels, slopes, tail_length(slopes))
+        p_dub, _ = ltas(ref.tail_signal(tl) + ref.sig, ref.regions)  # the tone filter only has to close what the tail leaves open
+        fir, g_db, _ = eq_filter(p_stem, p_dub, SR, p_noise=p_noise)
+        ir = tl.copy()
+        ir[0] += 1.0
+        h = fftconvolve(fir.astype(np.float32), ir).astype(np.float32)
+    energy = float(np.sum(tl.astype(np.float64) ** 2))
+    report = {**ir_report(h), "band_rt60_s": band_rt60(h)}
+    if not borrowed:
+        report["eq_edges"] = eq_edges(g_db, p_dub)
+    return {"h": h, "fir": fir.astype(np.float32), "eq_db": g_db, "model_drr_db": None if energy <= 0 else round(-10 * math.log10(energy), 1),
+            "report": report}
 
 
-def _own_record(evid):
-    se = decay_stat_se(evid["ev"])
-    tail = fit_tail(minus_ambient(evid["stat"], evid["floor_rel"]), se, evid["cnt"], evid["floor_rel"])
-    return _finish(None, evid, tail)
+def _t_dynamics(name, n, ranges, derev, spans, fir):
+    """Dynamics fit on the stem chunks at the absolute sample `ranges`."""
+    stem = _attach(name, n)
+    return fit_chunk_dynamics([stem[i0:i1] for i0, i1 in ranges], derev, spans, fir)
 
 
-def _task_borrow(args):
-    """Round 2: scene i without enough events of its own: tail of donor j (None = keep its own measured tail)."""
-    i, donor = args
-    evid = _stem_evidence(i)
-    if donor is None:
-        rec = _own_record(evid)
-    else:
-        rec = _finish(i, evid, (donor["levels"], donor["slopes"], donor["tail"]))
-        rec["report"] = {**ir_report(rec["h"]), "band_rt60_s": band_rt60(rec["h"])}
-    return i, rec
+def _worker_init():
+    """Pool workers: one BLAS thread each, constants built, numba kernel loaded."""
+    threadpool_limits(1)
+    _noise_bank()
+    _ref()
+    dynamics.warmup()
+
+
+def _ping():
+    return True
+
+
+# ----------------------------------------------------------------------------- the pool and the estimate
+
+_POOL = {}
+
+
+def _pool(workers):
+    """The persistent worker pool (created on first use, recreated when `workers` changes)."""
+    if _POOL.get("workers") != workers or _POOL["pool"]._broken:
+        if "pool" in _POOL:
+            _POOL["pool"].shutdown()
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload([__name__])
+        _POOL.update(workers=workers, pool=ProcessPoolExecutor(workers, mp_context=ctx, initializer=_worker_init))
+        wait([_POOL["pool"].submit(_ping) for _ in range(workers)])  # spawn all workers now
+    return _POOL["pool"]
+
+
+def prepare(workers=8):
+    """Start the worker pool and build the per-process constants (tail noise bank, reference voice analysis, numba kernel). Call
+    once at service start (about 1 s, parallel); otherwise the first estimate pays for it."""
+    _pool(workers)
 
 
 def _eq_samples(g_db):
@@ -769,60 +805,53 @@ def _eq_samples(g_db):
     return [round(float(v), 1) for v in g_db[np.searchsorted(f, [100, 200, 400, 800, 1600, 3200, 6400, 12800, 16000])]]
 
 
-def prepare():
-    """Build the per-process constants of the estimate (tail noise bank, reference voice analysis, numba kernel). Idempotent;
-    call once at service start (about 0.7 s), otherwise the first estimate pays for it."""
-    _noise_bank()
-    _ref()
-    dynamics.warmup()
+def _env_slices(i0, i1, workers):
+    """Sample ranges [(a, b)] whose band envelopes concatenate to the envelope of [i0, i1) (frames split, window overlap kept)."""
+    n = i1 - i0
+    if n < 2 * ENV_WIN:
+        return [(i0, i1)]
+    nfr = (n - ENV_WIN) // ENV_HOP + 1
+    k = int(np.clip(round(n / SR / 60.0), 1, workers))
+    f = np.linspace(0, nfr, k + 1).round().astype(int)
+    return [(i0 + a * ENV_HOP, i0 + (b - 1) * ENV_HOP + ENV_WIN) for a, b in zip(f[:-1], f[1:])]
 
 
 def estimate(clip, scene_doc, regions, workers=8):
-    """Channel of every scene, see the module docstring."""
+    """Channel of every scene, see the module docstring. The work of every scene is split over the pool as a task graph:
+    envelope slices -> decay statistics -> tail fit -> tone / IR -> dynamics fit, with the stem spectra and the dereverberated
+    chunks computed beside the tail fit."""
     sc_list = scene_doc["scenes"]
     n_sc = len(sc_list)
-    prepare()
-    clip.speech  # load before the pool forks
-    _Ctx.clip, _Ctx.regions, _Ctx.scenes = clip, [(float(a), float(b)) for a, b in regions], sc_list
-    pool = ProcessPoolExecutor(max(1, min(workers, n_sc)), mp_context=mp.get_context("fork"), initializer=_worker_init)
+    pool = _pool(workers)
+    stem = clip.speech
+    shm = shared_memory.SharedMemory(create=True, size=stem.nbytes)
     try:
-        own = {i: (summ, rec) for i, summ, rec in pool.map(_task_own, range(n_sc))}
-        good = [i for i in range(n_sc) if own[i][0] is not None and own[i][0]["good"]]
-        jobs, donors = [], {}
-        for i in range(n_sc):
-            summ, rec = own[i]
-            if summ is None or summ["good"]:
-                continue
-            sig = sc_list[i]["signature"]
-            cand = [(scenes_mod.signature_distance(sig, sc_list[j]["signature"]), j) for j in good
-                    if sig is not None and sc_list[j]["signature"] is not None]
-            donors[i] = min(cand)[1] if cand else None
-            jobs.append((i, None if donors[i] is None else own[donors[i]][1]))
-        for i, rec in pool.map(_task_borrow, jobs):
-            own[i] = (own[i][0], rec)
+        np.ndarray(stem.shape, np.float32, buffer=shm.buf)[:] = stem
+        S = _run_graph(pool, shm.name, len(stem), sc_list, [(float(a), float(b)) for a, b in regions], workers)
     finally:
-        pool.shutdown()
+        shm.close()
+        shm.unlink()
     out_scenes = []
-    stats = {i: own[i][1] for i in range(n_sc)}
     for i, sc in enumerate(sc_list):
         t0, t1 = sc["start"], sc["end"]
         rec = {"id": sc["id"], "start": round(t0, 2), "end": round(t1, 2), "speech_s": round(sc["speech_s"], 1), "n_atoms": sc.get("n_atoms"),
-               "signature_noise": sc.get("signature_noise"), "borrowed_from": None}
-        r = stats[i]
-        if i in donors:
-            rec["borrowed_from"] = sc_list[donors[i]]["id"] if donors[i] is not None else "none available: tail kept as measured"
-        rec["dynamics"] = None
-        if r is None:
+               "signature_noise": sc.get("signature_noise"), "borrowed_from": None, "dynamics": None}
+        s = S.get(i)
+        if s is None:
             rec["note"] = "pending"
-            r = {"h": np.ones(1, np.float32), "fir": None}
+            rec["_h"], rec["_fir"] = np.ones(1, np.float32), None
         else:
-            rec["dynamics"] = r["dynamics"]
-            rec.update({"tail": r["tail"], "report": r["report"], "model_drr_db": r["model_drr_db"], "n_events": r["n_events"],
-                        "eq_db_1_6_oct": _eq_samples(r["eq_db"]), "levels": r["levels"], "slopes": r["slopes"]})
-        rec["_h"], rec["_fir"] = r["h"], r["fir"]
-        rec["ir_len_s"] = round(len(r["h"]) / SR, 2)
+            if s["donor"] is not None:
+                rec["borrowed_from"] = sc_list[s["donor"]]["id"]
+            elif not s["good"]:
+                rec["borrowed_from"] = "none available: tail kept as measured"
+            tone = s["tone"]
+            rec.update({"tail": s["tail"][2], "report": tone["report"], "model_drr_db": tone["model_drr_db"], "n_events": len(s["sreg"]),
+                        "eq_db_1_6_oct": _eq_samples(tone["eq_db"]), "levels": s["tail"][0], "slopes": s["tail"][1], "dynamics": s["dyn"]})
+            rec["_h"], rec["_fir"] = tone["h"], tone["fir"]
+        rec["ir_len_s"] = round(len(rec["_h"]) / SR, 2)
         out_scenes.append(rec)
-    own_ids = [i for i, rec in enumerate(out_scenes) if rec.get("note") != "pending"]
+    own_ids = [i for i in range(n_sc) if i in S]
     for i, rec in enumerate(out_scenes):
         if rec.get("note") != "pending":
             continue
@@ -843,6 +872,87 @@ def estimate(clip, scene_doc, regions, workers=8):
             "scene_detection": {k: scene_doc.get(k) for k in ("candidate_boundaries", "noise_db", "params")}}
 
 
-def _worker_init():
-    """Pool workers: one BLAS thread each (the scenes are the parallelism)."""
-    threadpool_limits(1)
+def _run_graph(pool, name, n, sc_list, regions, workers):
+    """Run the per-scene task graph on the pool; returns {scene index: state} for the scenes with >= 2 regions (keys: sreg, good,
+    donor, tail, tone, dyn)."""
+    S = {}
+    for i, sc in enumerate(sc_list):
+        t0, t1 = sc["start"], sc["end"]
+        sreg = [(a - t0, b - t0) for a, b in window_regions(regions, t0, t1)]
+        if sc["speech_s"] <= 0 or len(sreg) < 2:
+            continue
+        i0, i1 = int(t0 * SR), int(t1 * SR)
+        slices = _env_slices(i0, i1, workers)
+        pieces = dynamics_chunks(sreg, (i1 - i0) / SR, dynamics.FIT_BUDGET_S)
+        ranges = [(i0 + int(a * SR), i0 + int(b * SR)) for a, b in pieces]
+        S[i] = {"sreg": sreg, "i0": i0, "i1": i1, "slices": slices, "db": [None] * len(slices), "ranges": ranges,
+                "spans": dynamics_inputs(sreg, (i1 - i0) / SR, pieces), "derev": [None] * len(ranges), "done": set()}
+    heavy = sum(1 for s in S.values() if s["i1"] - s["i0"] >= 60 * SR)  # scenes long enough to need the cores
+    fw = max(1, workers // max(heavy, 1))  # FFT / BLAS threads of the tail fit, the longest serial step
+    pending = {}
+
+    def submit(kind, i, k, fn, *args):
+        pending[pool.submit(fn, *args)] = (kind, i, k)
+
+    for i, s in S.items():
+        for k, (a, b) in enumerate(s["slices"]):
+            submit("env", i, k, _t_env, name, n, a, b, fw)
+        submit("spec", i, 0, _t_spectra, name, n, s["i0"], s["i1"], s["sreg"])
+        for k, (a, b) in enumerate(s["ranges"]):
+            submit("derev", i, k, _t_dereverb, name, n, a, b)
+    decided = False
+
+    def once(i, tag):
+        """True the first time (scene i, tag) is asked."""
+        if tag in S[i]["done"]:
+            return False
+        S[i]["done"].add(tag)
+        return True
+
+    def advance():
+        nonlocal decided
+        for i, s in S.items():
+            if all(d is not None for d in s["db"]) and once(i, "evidence"):
+                submit("evid", i, 0, _t_evidence, np.concatenate(s["db"]), s["sreg"])
+        if not decided and all("evid" in s for s in S.values()):
+            decided = True
+            good = [i for i, s in S.items() if enough_events(s["evid"]["cnt"])]
+            for i, s in S.items():
+                s["good"] = i in good
+                sig = sc_list[i]["signature"]
+                cand = [(scenes_mod.signature_distance(sig, sc_list[j]["signature"]), j) for j in good
+                        if not s["good"] and sig is not None and sc_list[j]["signature"] is not None]
+                s["donor"] = min(cand)[1] if cand else None
+                if s["good"] or s["donor"] is None:
+                    once(i, "fit")
+                    submit("fit", i, 0, _t_fit, s["evid"], fw)
+        for i, s in S.items():
+            if decided and "tail" not in s and s["donor"] is not None and "tail" in S[s["donor"]]:
+                s["tail"] = S[s["donor"]]["tail"]
+            if "tail" in s and "spec" in s and once(i, "tone"):
+                submit("tone", i, 0, _t_tone, s["tail"], s["spec"][0], s["spec"][2], s["donor"] is not None, fw)
+            if "tone" in s and all(d is not None for d in s["derev"]) and once(i, "dyn"):
+                submit("dyn", i, 0, _t_dynamics, name, n, s["ranges"], s["derev"], s["spans"], s["tone"]["fir"])
+
+    while pending:
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for f in done:
+            kind, i, k = pending.pop(f)
+            r = f.result()
+            s = S[i]
+            if kind == "env":
+                s["db"][k] = r
+            elif kind == "derev":
+                s["derev"][k] = r
+            elif kind == "spec":
+                s["spec"] = r
+            elif kind == "evid":
+                s["evid"] = r
+            elif kind == "fit":
+                s["tail"] = r
+            elif kind == "tone":
+                s["tone"] = r
+            elif kind == "dyn":
+                s["dyn"] = r
+        advance()
+    return S

@@ -14,7 +14,6 @@ import parselmouth
 from scipy.signal import find_peaks, resample_poly
 
 from .core import SR, FR, read_range, frame_db
-from .spans import activity
 
 CUE_SR = 16000
 MIN_VOICED_FRAMES = 20  # 0.2 s of voiced speech: fewer and the median pitch is noise

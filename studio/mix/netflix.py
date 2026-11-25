@@ -44,6 +44,8 @@ TONE_REF_HZ = (300.0, 3000.0)  # the tone filter is normalised over this band (c
 HP_TAPS = 4097
 FADE_S = 0.25  # bed treatment cross-fade at the scene edges
 MIN_DYN_SCENE_S = 1.0  # dynamics are not applied to scenes shorter than this
+MAX_TONE_BOOST_DB = 6.0  # (re the speech-band gain) the tone filter divides the stem's spectrum by the dry REFERENCE voice's, not by the clip's own dub (the lab's
+# 6 dB EQ_LIMIT_DB of the early matching EQ): a reference that lacks a band the actual voice has would otherwise boost it by 10-18 dB (panel_en scene 5, 60-115 Hz)
 TAIL_S = rooms.LATE_BANK_S + TAPS / SR  # the longest late layer (the bank) + the tone filter
 
 
@@ -115,6 +117,8 @@ def build_plan(chan, rooms_doc, defects_doc, locs):
         spread = float(np.sqrt(((mags - mag) ** 2 * w[:, None]).sum() / (w.sum() * mags.shape[1])))
         trt = defects[rep]["treatment"]
         mag = relax_edges(mag, trt.get("relax_hp_hz"), trt.get("relax_lp_hz"))
+        band = np.fft.rfftfreq(NFFT, 1 / SR)
+        mag = np.minimum(mag, np.median(mag[(band >= TONE_REF_HZ[0]) & (band <= TONE_REF_HZ[1])]) + MAX_TONE_BOOST_DB)
         dyn = scene_by_id[rep].get("dynamics")
         if dyn and not trt.get("copy_dynamics", True):
             dyn = None
