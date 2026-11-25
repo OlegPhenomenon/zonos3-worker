@@ -43,11 +43,40 @@ LAB = Path(os.environ.get('STUDIO_LAB', '/app/lab'))  # the lab code (mix_clip.p
 _sep = None
 _ser = None
 _gpu = threading.Lock()      # one separation at a time: the model owns the card
-_cpu = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 2, 4), thread_name_prefix='studio-cpu')
+# Request threads: mixes waiting for a slot hold one each, so there are more threads than slots (the emotion model and /prepare
+# polls never queue behind waiting mixes).
+_cpu = ThreadPoolExecutor(max_workers=12, thread_name_prefix='studio-cpu')
 _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
 _prepare_slot = threading.Lock()
-# Pieces mixed at once: each mix runs its WPE dereverberation on 6 processes; a Vast container gets ~15 cores of a big host.
-_mix_slots = threading.Semaphore(int(os.environ.get('STUDIO_MIXES', '3')))
+
+
+class EarliestFirst:
+    """`slots` mixes at once; a waiting mix of an earlier piece (lower startS) goes before a later one, whatever came first:
+    the runner dubs pieces side by side, and the windows playback needs next come from the earliest piece."""
+
+    def __init__(self, slots):
+        self.free, self.waiting, self.cond = slots, [], threading.Condition()
+
+    @contextlib.contextmanager
+    def slot(self, priority):
+        with self.cond:
+            entry = (priority, uuid.uuid4().hex)
+            self.waiting.append(entry)
+            while not (self.free and min(self.waiting) == entry):
+                self.cond.wait()
+            self.waiting.remove(entry)
+            self.free -= 1
+            self.cond.notify_all()
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.free += 1
+                self.cond.notify_all()
+
+
+# Pieces mixed at once: each mix runs its WPE dereverberation on 6 processes; the pool takes hosts with >= 12 cores.
+_mix_slots = EarliestFirst(int(os.environ.get('STUDIO_MIXES', '3')))
 UNITS_PER_WORKER_S = 17.0  # /prepare benchmark: ~17 seconds of video separated per second of worker time
 SER_S_PER_CLIP = 0.3
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
@@ -336,7 +365,7 @@ def mix_piece_blocking(p: dict) -> dict:
     if start_s < 0 or rate not in (44100, 48000) or not 0 < frames <= MAX_PIECE_S * rate or 'report' not in summary:
         raise Fail('bad_request', f'need startS >= 0, rate 44100|48000, 0 < frames <= {MAX_PIECE_S} s, a summary with report')
     t0 = time.time()
-    with using(d.name), _mix_slots:
+    with using(d.name), _mix_slots.slot(start_s):
         tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='piece-'))
         try:
             clip = tmp / 'data' / 'exp' / 'piece'
