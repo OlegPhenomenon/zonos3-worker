@@ -20,6 +20,7 @@ import numpy as np
 from .core import SR
 
 BITRATE = "160k"
+COMPLEXITY = "2"      # libopus complexity: 0.5 s per 30 s window instead of 1.4 s at the default 10, same waveform SNR (23 dB) at 160 kbit/s
 LOOKAHEAD = 312      # libopus encoder delay at 48 kHz (ffmpeg's initial_padding)
 FRAME = 960          # 20 ms
 PAGE_PACKETS = 25    # 0.5 s per page
@@ -63,7 +64,7 @@ def _packets(ogg):
 def _opus_packets(pcm):
     """(2, n) float32 -> list of 20 ms Opus packets (the first two Ogg packets, OpusHead and OpusTags, dropped)."""
     r = subprocess.run(["ffmpeg", "-v", "error", "-f", "f32le", "-ar", str(SR), "-ac", "2", "-i", "-", "-c:a", "libopus", "-b:a", BITRATE,
-                        "-vbr", "on", "-application", "audio", "-frame_duration", "20", "-f", "ogg", "-"],
+                        "-vbr", "on", "-compression_level", COMPLEXITY, "-application", "audio", "-frame_duration", "20", "-f", "ogg", "-"],
                        input=np.ascontiguousarray(pcm.T, dtype=np.float32).tobytes(), capture_output=True, check=True)
     return _packets(r.stdout)[2:]
 
