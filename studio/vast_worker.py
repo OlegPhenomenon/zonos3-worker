@@ -46,6 +46,7 @@ _sep = None
 _gpu = threading.Lock()      # one separation at a time: the model owns the card
 _cpu = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 2, 4), thread_name_prefix='studio-cpu')
 _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
+_prepare_slot = threading.Lock()
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
 _cache_lock = threading.Lock()
 
@@ -268,7 +269,7 @@ def answer_prepared(d: Path, cached: bool) -> dict:
 
 
 def prepare_in_use(url: str, audio_hash: str) -> dict:
-    with using(audio_hash):
+    with _prepare_slot, using(audio_hash):  # one preparation at a time: two analyses side by side exhaust the host's threads
         return prepare_blocking(url, audio_hash)
 
 

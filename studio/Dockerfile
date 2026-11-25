@@ -54,6 +54,9 @@ RUN missing=$(ldd /py/onnxruntime/capi/libonnxruntime_providers_cuda.so | grep '
 COPY NOTICE-BANDIT.txt /app/
 COPY models/ /app/models/
 ENV STUDIO_MODEL=/app/models/bandit_speech.onnx STUDIO_CACHE_DIR=/var/studio-cache STUDIO_CACHE_GB=40
+# Every process of the mix pools would otherwise start one BLAS / OpenMP / numba thread per host core (20+ on big hosts):
+# with the pools and a running separation that runs into the host's thread limit and kills the worker.
+ENV OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMBA_NUM_THREADS=4
 COPY __init__.py sep.py vast_worker.py /app/studio/
 COPY mix/ /app/studio/mix/
 # Build gate for the mix library; numba compiles its kernels once here (cache in studio/mix/__pycache__) instead of on the first request.
