@@ -2,7 +2,8 @@
 on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dispatch like slim/vast_worker.py.
 
 Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answer}):
-  /prepare {audioUrl, audioHash}        -> {audioHash, durationMs, speechSpans, speechStem, timings, cached}
+  /prepare {audioUrl, audioHash}        -> {"pending": true} while the file is being prepared in the background (ask again),
+                                           then {audioHash, durationMs, speechSpans, speechStem, timings, cached}
   /cues    {audioHash, parts}           -> {audioHash, parts: {id: {pitch_st, range_st, loud_db, rate_sps, clip_ogg}}, speakers: {spk: b64}}
   /mix     {audioHash, segment, segmentMs, parts, nonverbal?: [[startMs, endMs]]} -> {segment, audio, timings}
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
@@ -44,7 +45,7 @@ except Exception as e:  # missing or broken mix library: /prepare, /cues and /mi
 _sep = None
 _gpu = threading.Lock()      # one separation at a time: the model owns the card
 _cpu = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 2, 4), thread_name_prefix='studio-cpu')
-_prepare_locks: dict[str, asyncio.Lock] = {}
+_prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
 _cache_lock = threading.Lock()
 
@@ -266,7 +267,15 @@ def answer_prepared(d: Path, cached: bool) -> dict:
             'speechStem': base64.b64encode((d / 'speech.opus').read_bytes()).decode(), 'timings': meta['timings'], 'cached': cached}
 
 
+def prepare_in_use(url: str, audio_hash: str) -> dict:
+    with using(audio_hash):
+        return prepare_blocking(url, audio_hash)
+
+
 async def prepare(**p) -> dict:
+    """Starts the preparation of a new audio file in the background and answers {"pending": true} at once; the caller asks
+    again (same worker) until the answer is the prepared file. A 10-min file takes about a minute, longer than a proxied
+    request may stay open, so the call itself never waits for it."""
     try:
         if mix_api is None:
             raise Fail('mix_unavailable', MIX_ERROR)
@@ -274,10 +283,18 @@ async def prepare(**p) -> dict:
         url = p.get('audioUrl')
         if not isinstance(url, str) or not url:
             raise Fail('bad_request', 'audioUrl required')
-        lock = _prepare_locks.setdefault(h, asyncio.Lock())  # a retry of the same hash waits for the running one, then hits the cache
-        async with lock:
-            with using(h):
-                return await asyncio.get_running_loop().run_in_executor(_cpu, prepare_blocking, url, h)
+        final = stems_dir(h)
+        if (final / 'prepare.json').exists():
+            return answer_prepared(final, cached=True)
+        job = _prepare_jobs.get(h)
+        if job is None:
+            job = _prepare_jobs[h] = asyncio.get_running_loop().run_in_executor(_cpu, prepare_in_use, url, h)
+        if p.get('wait'):  # the PyWorker benchmark measures the whole preparation
+            await asyncio.wait({job})
+        if not job.done():
+            return {'audioHash': h, 'pending': True}
+        _prepare_jobs.pop(h, None)
+        return job.result()
     except Fail as e:
         return answer_error(e)
 
@@ -375,7 +392,7 @@ def main():
     # Workload is seconds of video: /prepare costs the file length (the backend may pass durationMs, else a 10 min typical file),
     # a /mix window or /cues call a fixed slice. Only /prepare is benchmarked (the others need a prepared file); a fresh audioHash
     # per run so the disk cache never answers the benchmark.
-    bench = BenchmarkConfig(generator=lambda: {'audioUrl': BENCH_URL, 'audioHash': f'bench-{uuid.uuid4().hex[:12]}', 'durationMs': 60000},
+    bench = BenchmarkConfig(generator=lambda: {'audioUrl': BENCH_URL, 'audioHash': f'bench-{uuid.uuid4().hex[:12]}', 'durationMs': 60000, 'wait': True},
                             runs=2, concurrency=1, do_warmup=False)
     common = dict(is_remote_dispatch=True, allow_parallel_requests=True, max_queue_time=900.0)
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[
