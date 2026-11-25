@@ -6,18 +6,24 @@ and its analyses) on its own stems. The lab code (tool/studio_dub_lab of mobile-
 build time and runs unchanged; the studio runner on the prod host does the rest (transcription, translation, Zonos, checks).
 
 Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answer}):
-  /prepare   {audioUrl, audioHash}  -> {"pending": true} while the file is being separated in the background (ask again),
-                                       then {audioHash, durationMs, speechStem, timings, cached}
+  /prepare   {audioUrl, audioHash, haveHead?}
+                                    -> {"pending": true} while the file is being separated in the background (ask again); once the
+                                       head (the first HEAD_S of a longer file) is separated, the pending answer also carries
+                                       {durationMs, headS, speechHead} (not when the caller says haveHead), then
+                                       {audioHash, durationMs, speechStem, timings, cached}
   /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
   /mix_piece {audioHash, startS, rate, frames, dub: flac, nonverbal: flac, summary: json text}
                                     -> {mix: flac (stereo, `rate`, `frames` samples), timings}: the piece of the video from startS,
-                                       its stems and original sound cut from the cache, mixed by mix_clip.py netflix
+                                       its stems and original sound cut from the cache (from the head's while the whole file is
+                                       still being separated, for a piece inside the head), mixed by mix_clip.py netflix
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
 download_failed, prepare_failed, ser_failed, mix_failed.
 
 Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json}, least recently used evicted
 above STUDIO_CACHE_GB (default 40). The directory appears atomically (renamed from <hash>.tmp) only after a complete prepare.
+CACHE_DIR/<audioHash>.head/ holds the same files for the first HEAD_S + HEAD_PAD_S of a long file, separated first: the separator
+works in 8 s chunks with no state across them, so up to HEAD_S + HEAD_PAD_S - 8 s the head's stems are the whole file's.
 """
 import asyncio, base64, contextlib, ipaddress, json, logging, math, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +45,8 @@ HASH_RE = re.compile(r'^[A-Za-z0-9_-]{6,128}$')
 BENCH_URL = 'bench:'  # the Vast startup benchmark: the first minute of a bundled clip, no download
 MAX_PIECE_S = 300     # longest piece /mix_piece mixes
 LAB = Path(os.environ.get('STUDIO_LAB', '/app/lab'))  # the lab code (mix_clip.py, emotion_ser.py)
+HEAD_S = 120          # a longer file's first HEAD_S are separated (and answered) first: the runner starts dubbing on them
+HEAD_PAD_S = 16       # separated past HEAD_S: the stems of the last chunks are the whole file's only once the next chunks exist
 
 _sep = None
 _ser = None
@@ -75,8 +83,9 @@ class EarliestFirst:
                 self.cond.notify_all()
 
 
-# Pieces mixed at once: each mix runs its WPE dereverberation on 6 processes; the pool takes hosts with >= 12 cores.
-_mix_slots = EarliestFirst(int(os.environ.get('STUDIO_MIXES', '3')))
+# Pieces mixed at once: each mix runs its analyses side by side on half the cores (fork_pool.py) and its WPE dereverberation on 6
+# processes; the pool takes hosts with >= 12 cores.
+_mix_slots = EarliestFirst(int(os.environ.get('STUDIO_MIXES', '2')))
 UNITS_PER_WORKER_S = 17.0  # /prepare benchmark: ~17 seconds of video separated per second of worker time
 SER_S_PER_CLIP = 0.3
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
@@ -191,11 +200,21 @@ def need_hash(p: dict) -> str:
     return h
 
 
-def need_prepared(p: dict) -> Path:
-    d = stems_dir(need_hash(p))
-    if not (d / 'prepare.json').exists():
-        raise Fail('not_prepared', p['audioHash'])
-    return d
+def head_dir(audio_hash: str) -> Path:
+    return CACHE_DIR / f'{audio_hash}.head'
+
+
+def stems_for(p: dict, end_s: float) -> Path:
+    """The directory whose stems a request up to end_s seconds of the video uses: the whole file's once prepared, else the
+    head's when end_s lies in its exact part (HEAD_S + HEAD_PAD_S - 8 s), else not_prepared (the caller runs /prepare)."""
+    h = need_hash(p)
+    d = stems_dir(h)
+    if (d / 'prepare.json').exists():
+        return d
+    hd = head_dir(h)
+    if (hd / 'head.json').exists() and end_s <= HEAD_S + HEAD_PAD_S - 8:
+        return hd
+    raise Fail('not_prepared', p['audioHash'])
 
 
 # ---------------------------------------------------------------- /prepare
@@ -252,11 +271,27 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
         if dur / 1000 > MAX_AUDIO_S:
             raise Fail('too_long', f'{dur / 60000:.0f} min > {MAX_AUDIO_S / 60:.0f} min')
         evict(keep=audio_hash)
+        t['gpu_wait_s'] = 0.0
+        from . import sep
+        if dur / 1000 > HEAD_S + 2 * HEAD_PAD_S:
+            # The head first (a few seconds on the card): the runner transcribes and dubs it while the rest is separated.
+            head = head_dir(audio_hash)
+            shutil.rmtree(head, ignore_errors=True)
+            head.mkdir()
+            run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-t', str(HEAD_S + HEAD_PAD_S), '-i', str(tmp / 'mix.flac'), '-c:a', 'flac',
+                 str(head / 'mix.flac')], 'prepare_failed', 120)
+            s = time.time()
+            with _gpu:
+                t['gpu_wait_s'] += round(time.time() - s, 2)
+                s = time.time()
+                sep.separate_file(head / 'mix.flac', head, _sep)
+            encode_stem(head / 'speech.flac', head / 'speech.opus')
+            (head / 'head.json').write_text(json.dumps({'durationMs': dur, 'headS': HEAD_S}))
+            t['head_s'] = round(time.time() - t0, 2)
         s = time.time()
         with _gpu:
-            t['gpu_wait_s'] = round(time.time() - s, 2)
+            t['gpu_wait_s'] += round(time.time() - s, 2)
             s = time.time()
-            from . import sep
             sep.separate_file(tmp / 'mix.flac', tmp, _sep)
         t['separate_s'] = round(time.time() - s, 2)
         s = time.time()
@@ -305,6 +340,11 @@ async def prepare(**p) -> dict:
         if p.get('wait'):  # the PyWorker benchmark measures the whole preparation
             await asyncio.wait({job})
         if not job.done():
+            hd = head_dir(h)
+            if not p.get('haveHead') and (hd / 'head.json').exists():
+                meta = json.loads((hd / 'head.json').read_text())
+                return {'audioHash': h, 'pending': True, 'durationMs': meta['durationMs'], 'headS': meta['headS'],
+                        'speechHead': base64.b64encode((hd / 'speech.opus').read_bytes()).decode()}
             return {'audioHash': h, 'pending': True}
         _prepare_jobs.pop(h, None)
         return job.result()
@@ -356,7 +396,6 @@ def cut(src: Path, start_s: float, rate: int, frames: int, channels: int, dst: P
 
 
 def mix_piece_blocking(p: dict) -> dict:
-    d = need_prepared(p)
     try:
         start_s, rate, frames = float(p['startS']), int(p['rate']), int(p['frames'])
         summary = json.loads(p['summary'])
@@ -364,6 +403,7 @@ def mix_piece_blocking(p: dict) -> dict:
         raise Fail('bad_request', repr(e))
     if start_s < 0 or rate not in (44100, 48000) or not 0 < frames <= MAX_PIECE_S * rate or 'report' not in summary:
         raise Fail('bad_request', f'need startS >= 0, rate 44100|48000, 0 < frames <= {MAX_PIECE_S} s, a summary with report')
+    d = stems_for(p, start_s + frames / rate)
     t0 = time.time()
     with using(d.name), _mix_slots.slot(start_s):
         tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='piece-'))
