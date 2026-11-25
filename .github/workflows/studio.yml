@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Bandit v2 speech branch as ONNX (studio/tool/export_bandit.py, CC BY-SA 4.0): release asset, private repo, job token.
-      - run: gh release download bandit-v2-speech-onnx --repo ${{ github.repository }} -p '*.onnx' -D studio/models
+      - run: gh release download bandit-v2-speech-onnx --repo ${{ github.repository }} -p 'bandit_speech.onnx' -D studio/models
       # studio/mix is the mix library's directory: without it the worker still starts and answers mix_unavailable.
       - run: mkdir -p studio/mix
         env:
