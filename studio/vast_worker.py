@@ -48,6 +48,8 @@ _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation runnin
 _prepare_slot = threading.Lock()
 # Pieces mixed at once: each mix runs its WPE dereverberation on 6 processes; a Vast container gets ~15 cores of a big host.
 _mix_slots = threading.Semaphore(int(os.environ.get('STUDIO_MIXES', '3')))
+UNITS_PER_WORKER_S = 17.0  # /prepare benchmark: ~17 seconds of video separated per second of worker time
+SER_S_PER_CLIP = 0.3
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
 _cache_lock = threading.Lock()
 
@@ -419,18 +421,20 @@ def main():
             log.warning('%s; serving plain HTTP', e)  # as in slim/vast_worker.py
             os.environ['USE_SSL'] = 'false'
     from vastai.serverless.server.worker import BenchmarkConfig, HandlerConfig, Worker, WorkerConfig
-    # Workload is seconds of video: /prepare costs the file length (the backend passes durationMs; its polls pass 1 ms),
-    # /mix_piece the piece, /ser a second per clip. Only /prepare is benchmarked; a fresh audioHash per run so the disk cache never
-    # answers it.
+    # Workload units are what the /prepare benchmark measures: seconds of video separated, ~17 per second of worker time. The
+    # other routes are priced in the same units by the worker time they take (measured: a piece's mix ~1 s per second of the
+    # piece, the emotion model ~0.3 s per clip), so the autoscaler sees a mixing worker as busy and never stops it mid-request.
+    # /prepare's polls pass durationMs 1. A fresh audioHash per benchmark run so the disk cache never answers it.
     bench = BenchmarkConfig(generator=lambda: {'audioUrl': BENCH_URL, 'audioHash': f'bench-{uuid.uuid4().hex[:12]}', 'durationMs': 60000, 'wait': True},
                             runs=2, concurrency=1, do_warmup=False)
     common = dict(is_remote_dispatch=True, allow_parallel_requests=True, max_queue_time=900.0)
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[
         HandlerConfig(route='/prepare', remote_function=prepare, benchmark_config=bench,
                       workload_calculator=lambda p: float(p.get('durationMs') or 600000) / 1000, **common),
-        HandlerConfig(route='/ser', remote_function=ser, workload_calculator=lambda p: float(len(p.get('clips') or {}) or 1), **common),
+        HandlerConfig(route='/ser', remote_function=ser,
+                      workload_calculator=lambda p: UNITS_PER_WORKER_S * SER_S_PER_CLIP * max(1, len(p.get('clips') or {})), **common),
         HandlerConfig(route='/mix_piece', remote_function=mix_piece,
-                      workload_calculator=lambda p: float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common)])).run()
+                      workload_calculator=lambda p: UNITS_PER_WORKER_S * float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common)])).run()
 
 
 if __name__ == '__main__':
