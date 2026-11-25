@@ -15,8 +15,9 @@ ENDPOINT_NAME="${VAST_ENDPOINT:-studio-prep}"
 VAST_URL=https://console.vast.ai/api/v0
 DISK_GB=80
 MAX_DPH="${VAST_MAX_DPH:-0.15}"
+# Ampere only: on an RTX 4070 (Ada, sm_89, driver 580) the fp16 separator returned NaN on CUDA (the worker now refuses to start then).
 SEARCH_PARAMS="gpu_name in [RTX_3060,RTX_3060_Ti,RTX_3070,RTX_3070_Ti,RTX_3080,RTX_3080_Ti,RTX_A4000,RTX_A4500,RTX_A5000,\
-RTX_4060_Ti,RTX_4070,RTX_4070_Ti,RTX_4000Ada,RTX_3090,RTX_4080,RTX_4090] dph_total<=$MAX_DPH compute_cap>=860 compute_cap<900 \
+RTX_3090] dph_total<=$MAX_DPH compute_cap>=860 compute_cap<870 \
 gpu_ram>=8 cpu_ram>=16 inet_down>=500 reliability>=0.98 cuda_max_good>=12.4 num_gpus=1 disk_space>=$DISK_GB verified=true rentable=true rented=false"
 LAUNCH_ARGS="--image $IMAGE:$TAG --env '-p 3000:3000' --disk $DISK_GB --onstart-cmd 'cd /app && exec python3 -u -m studio.vast_worker'"
 

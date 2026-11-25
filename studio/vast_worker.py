@@ -316,7 +316,10 @@ def load_separator():
     if 'CUDAExecutionProvider' not in _sep.sess.get_providers():  # onnxruntime falls back to CPU silently; that is ~50x slower
         raise RuntimeError(f'CUDA provider not active: {_sep.sess.get_providers()}')
     import numpy as np
-    _sep.speech(np.zeros((2, 10 * 48000), np.float32))  # cuDNN algorithm selection and allocator warm-up
+    noise = (np.random.default_rng(0).standard_normal((2, 10 * 48000)) * 0.05).astype(np.float32)
+    out = _sep.speech(noise)  # also the cuDNN algorithm selection and allocator warm-up
+    if not np.isfinite(out).all():  # seen on an RTX 4070 (sm_89, driver 580): the fp16 model returns NaN on CUDA only
+        raise RuntimeError(f'separator returns non-finite output on this GPU ({np.isnan(out).mean():.0%} NaN)')
     log.info('separator ready in %.1f s (%s)', time.time() - t, os.path.basename(MODEL))
 
 
