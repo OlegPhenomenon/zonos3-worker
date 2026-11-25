@@ -2,8 +2,8 @@
 # (no PyTorch); the dub itself is built by the studio runner. Every new Vast host pulls the whole image before its first request, so each stage below
 # ships only what the worker runs:
 #   * CUDA/cuDNN: only the libraries ONNX Runtime's CUDA provider loads for this model (cudart, cuBLAS, cuBLASLt, cuFFT, cuRAND,
-#     cuDNN core/ops/adv/graph/heuristic), with GPU code for sm_80/86/89 only (workers are Ampere/Ada: the Vast search is
-#     compute_cap >= 860 < 900); the provider library itself is pruned the same way
+#     cuDNN core/ops/adv/graph/heuristic), with GPU code for sm_80/86/89 only (workers are Ampere: the Vast search is
+#     compute_cap 860..869, scripts/studio_setup.sh); the provider library itself is pruned the same way
 #   * Python: site-packages built in a throwaway stage, no pip in the image
 # Layers go from rarely to often changed, so a host that pulled an older tag re-downloads only the top layers.
 ARG UBUNTU=ubuntu:22.04
