@@ -40,7 +40,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # Binaries run on older 12.x drivers through CUDA minor-version compatibility; don't let the image refuse them.
 ENV NVIDIA_DISABLE_REQUIRE=1
 # ffmpeg: decodes the source audio, encodes the opus speech stem and the AAC windows (libopus, native aac).
-RUN apt-get update && apt-get install -y --no-install-recommends python3 ffmpeg libgomp1 ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-distutils ffmpeg libgomp1 ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libopus|aac' | wc -l | grep -qx 2
 COPY --from=cudalibs /out/ /usr/local/lib/
