@@ -209,8 +209,9 @@ class Reference:
     through its dry decay statistics, its long-term spectrum and the nominal regions of its speech."""
 
     def __init__(self):
-        self.sig = load_audio(ASSETS / "dry_reference.flac", 1, SR)[0]
-        self.regions = [tuple(r) for r in json.load(open(ASSETS / "dry_reference.json"))["regions"]]
+        name = os.environ.get("STUDIO_MIX_REFERENCE", "dry_reference")  # alternative reference voices (tests / gender-specific tone)
+        self.sig = load_audio(ASSETS / (name + ".flac"), 1, SR)[0]
+        self.regions = [tuple(r) for r in json.load(open(ASSETS / (name + ".json")))["regions"]]
         self.duration_s = len(self.sig) / SR
 
     def excerpt(self, seconds):
