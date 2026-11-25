@@ -1,5 +1,10 @@
 name: Build studio-prep worker
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      lab_ref:
+        description: commit or branch of mobile-universal-dubber whose tool/studio_dub_lab goes into the image
+        default: studio-worker-lab
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -8,8 +13,24 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      # Bandit v2 speech branch as ONNX (studio/tool/export_bandit.py, CC BY-SA 4.0): release asset, private repo, job token.
-      - run: gh release download bandit-v2-speech-onnx --repo ${{ github.repository }} -p 'bandit_speech.onnx' -D studio/models
+      # The lab code the worker runs unchanged (mix_clip.py, dub_mix.py and its analyses, emotion_ser.py); read-only deploy key.
+      - uses: actions/checkout@v4
+        with:
+          repository: OlegPhenomenon/mobile-universal-dubber
+          ref: ${{ inputs.lab_ref }}
+          ssh-key: ${{ secrets.LAB_REPO_KEY }}
+          path: lab-src
+          sparse-checkout: tool/studio_dub_lab
+      - id: lab
+        run: |
+          rsync -a --exclude runner --exclude voice_bank --exclude __pycache__ lab-src/tool/studio_dub_lab/ studio/lab/
+          git -C lab-src rev-parse HEAD > studio/lab/LAB_REF
+          echo "ref=$(git -C lab-src rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+      # Bandit v2 speech branch (studio/tool/export_bandit.py, CC BY-SA 4.0) and emotion2vec+ large
+      # (mobile-universal-dubber tool/studio_dub_lab/emotion_onnx_export.py) as ONNX: release assets, private repo, job token.
+      - run: |
+          gh release download bandit-v2-speech-onnx --repo ${{ github.repository }} -p 'bandit_speech.onnx' -D studio/models
+          gh release download emotion2vec-plus-large-onnx --repo ${{ github.repository }} -p '*' -D studio/models/emotion2vec
         env:
           GH_TOKEN: ${{ github.token }}
       - uses: docker/setup-buildx-action@v3
@@ -22,4 +43,4 @@ jobs:
         with:
           context: studio
           push: true
-          tags: ghcr.io/olegphenomenon/zonos3-worker:studio-${{ github.sha }}
+          tags: ghcr.io/olegphenomenon/zonos3-worker:studio-${{ github.sha }}-lab-${{ steps.lab.outputs.ref }}

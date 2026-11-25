@@ -4,3 +4,6 @@ bank/build.log
 proxy/.token
 proxy/*.wav
 proxy/.token.old-leaked
+# studio image inputs CI fetches: ONNX models (release assets) and the lab code (mobile-universal-dubber)
+studio/models/
+studio/lab/

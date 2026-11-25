@@ -1,6 +1,7 @@
 numpy==2.2.6
 scipy==1.15.3
 soundfile==0.13.1
+nara_wpe
 onnxruntime-gpu==1.23.2
 requests
 cryptography

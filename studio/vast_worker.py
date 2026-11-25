@@ -1,20 +1,25 @@
 """Vast.ai Serverless mode, the studio-prep worker (docs/architecture/studio-dub-realtime.md): the Vast PyWorker (vastai SDK)
-on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dispatch like slim/vast_worker.py. It separates the
-dialogue from the rest of a video's sound on the GPU and serves the stems; the dub itself is built by the studio runner.
+on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dispatch like slim/vast_worker.py. The GPU and CPU
+heavy steps of the studio dub: it separates the dialogue from the rest of a video's sound, recognizes how each line is spoken
+(emotion2vec+ large, ONNX on the GPU) and mixes each dubbed piece with the draft's mix (the lab's mix_clip.py: dub_mix.py netflix
+and its analyses) on its own stems. The lab code (tool/studio_dub_lab of mobile-universal-dubber) is copied into the image at
+build time and runs unchanged; the studio runner on the prod host does the rest (transcription, translation, Zonos, checks).
 
 Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answer}):
-  /prepare {audioUrl, audioHash}        -> {"pending": true} while the file is being separated in the background (ask again),
-                                           then {audioHash, durationMs, speechStem, timings, cached}
-  /stems   {audioHash, startMs, endMs}  -> {audioHash, startMs, endMs, speech, bg}: that stretch of the stems as FLAC
-                                           (speech mono, bg stereo, 44.1 kHz 16 bit)
+  /prepare   {audioUrl, audioHash}  -> {"pending": true} while the file is being separated in the background (ask again),
+                                       then {audioHash, durationMs, speechStem, timings, cached}
+  /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
+  /mix_piece {audioHash, startS, rate, frames, dub: flac, nonverbal: flac, summary: json text}
+                                    -> {mix: flac (stereo, `rate`, `frames` samples), timings}: the piece of the video from startS,
+                                       its stems and original sound cut from the cache, mixed by mix_clip.py netflix
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
-download_failed, prepare_failed, stems_failed.
+download_failed, prepare_failed, ser_failed, mix_failed.
 
 Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json}, least recently used evicted
 above STUDIO_CACHE_GB (default 40). The directory appears atomically (renamed from <hash>.tmp) only after a complete prepare.
 """
-import asyncio, base64, contextlib, ipaddress, json, logging, os, re, shutil, subprocess, threading, time, uuid
+import asyncio, base64, contextlib, ipaddress, json, logging, math, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -32,9 +37,11 @@ MAX_AUDIO_S = float(os.environ.get('STUDIO_MAX_AUDIO_MIN', '180')) * 60  # RAM: 
 DOWNLOAD_TIMEOUT_S = int(os.environ.get('STUDIO_DOWNLOAD_TIMEOUT_S', '300'))
 HASH_RE = re.compile(r'^[A-Za-z0-9_-]{6,128}$')
 BENCH_URL = 'bench:'  # the Vast startup benchmark: the first minute of a bundled clip, no download
-MAX_STEMS_S = 300     # longest stretch /stems returns in one answer
+MAX_PIECE_S = 300     # longest piece /mix_piece mixes
+LAB = Path(os.environ.get('STUDIO_LAB', '/app/lab'))  # the lab code (mix_clip.py, emotion_ser.py)
 
 _sep = None
+_ser = None
 _gpu = threading.Lock()      # one separation at a time: the model owns the card
 _cpu = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 2, 4), thread_name_prefix='studio-cpu')
 _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
@@ -272,34 +279,92 @@ async def prepare(**p) -> dict:
         return answer_error(e)
 
 
-# ---------------------------------------------------------------- /stems
-def flac_slice(src: Path, start_s: float, end_s: float, channels: int) -> bytes:
-    r = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{start_s:.3f}', '-to', f'{end_s:.3f}', '-i', str(src),
-                        '-ac', str(channels), '-ar', '44100', '-sample_fmt', 's16', '-c:a', 'flac', '-f', 'flac', '-'],
-                       capture_output=True, timeout=120)
-    if r.returncode:
-        raise Fail('stems_failed', r.stderr.decode(errors='replace')[-300:])
-    return r.stdout
+# ---------------------------------------------------------------- /ser
+def decode_b64(value, what):
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as e:
+        raise Fail('bad_request', f'{what}: {e!r}')
 
 
-def stems_blocking(p: dict) -> dict:
+def ser_blocking(p: dict) -> dict:
+    clips = p.get('clips')
+    if not isinstance(clips, dict) or not clips:
+        raise Fail('bad_request', 'clips must be {id: base64 audio}')
+    tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='ser-'))
+    try:
+        out = {}
+        for cid, b64 in clips.items():
+            path = tmp / f'{len(out)}.flac'
+            path.write_bytes(decode_b64(b64, cid))
+            out[str(cid)] = _ser.probs(str(path))
+        return {'probs': out}
+    except Fail:
+        raise
+    except Exception as e:
+        log.exception('ser failed')
+        raise Fail('ser_failed', repr(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def ser(**p) -> dict:
+    try:
+        return await asyncio.get_running_loop().run_in_executor(_cpu, ser_blocking, p)
+    except Fail as e:
+        return answer_error(e)
+
+
+# ---------------------------------------------------------------- /mix_piece
+def cut(src: Path, start_s: float, rate: int, frames: int, channels: int, dst: Path) -> None:
+    """`frames` samples at `rate` of src from start_s (resampled first, then padded / trimmed to the exact length)."""
+    run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-ss', f'{start_s:.6f}', '-i', str(src), '-ac', str(channels),
+         '-af', f'aresample={rate},apad=whole_len={frames},atrim=end_sample={frames}', str(dst)], 'mix_failed', 300)
+
+
+def mix_piece_blocking(p: dict) -> dict:
     d = need_prepared(p)
     try:
-        a, b = int(p['startMs']), int(p['endMs'])
+        start_s, rate, frames = float(p['startS']), int(p['rate']), int(p['frames'])
+        summary = json.loads(p['summary'])
     except (KeyError, TypeError, ValueError) as e:
         raise Fail('bad_request', repr(e))
-    if not 0 <= a < b or b - a > MAX_STEMS_S * 1000:
-        raise Fail('bad_request', f'need 0 <= startMs < endMs and at most {MAX_STEMS_S} s')
+    if start_s < 0 or rate not in (44100, 48000) or not 0 < frames <= MAX_PIECE_S * rate or 'report' not in summary:
+        raise Fail('bad_request', f'need startS >= 0, rate 44100|48000, 0 < frames <= {MAX_PIECE_S} s, a summary with report')
+    t0 = time.time()
     with using(d.name):
-        speech = flac_slice(d / 'speech.flac', a / 1000, b / 1000, 1)
-        bg = flac_slice(d / 'bg.flac', a / 1000, b / 1000, 2)
-    return {'audioHash': d.name, 'startMs': a, 'endMs': b,
-            'speech': base64.b64encode(speech).decode(), 'bg': base64.b64encode(bg).decode()}
+        tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='piece-'))
+        try:
+            clip = tmp / 'data' / 'exp' / 'piece'
+            (clip / 'iso').mkdir(parents=True)
+            cut(d / 'mix.flac', start_s, rate, frames, 2, clip / 'mix.wav')
+            cut(d / 'speech.flac', start_s, rate, frames, 2, clip / 'bandit_speech.flac')
+            cut(d / 'bg.flac', start_s, rate, frames, 2, clip / 'bandit_bg.flac')
+            for name, field in (('dub_track.wav', 'dub'), ('nonverbal.wav', 'nonverbal')):
+                src = tmp / f'{field}.flac'
+                src.write_bytes(decode_b64(p.get(field, ''), field))
+                run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src), '-ac', '1', '-ar', str(rate), str(clip / 'iso' / name)],
+                    'bad_request', 120)
+            (clip / 'iso' / 'summary.json').write_text(json.dumps(summary))
+            t_in = time.time() - t0
+            env = {**os.environ, 'LAB_DATA': str(tmp / 'data')}
+            r = subprocess.run(['python3', str(LAB / 'mix_clip.py'), 'piece', 'netflix'], cwd=str(LAB), env=env,
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode:
+                raise Fail('mix_failed', r.stderr[-600:])
+            stages = [l for l in r.stderr.splitlines() if l.startswith('[mix ')]
+            flac = tmp / 'mix.flac'
+            run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(clip / 'iso' / 'mix_netflix.wav'), '-c:a', 'flac', str(flac)],
+                'mix_failed', 120)
+            return {'mix': base64.b64encode(flac.read_bytes()).decode(),
+                    'timings': {'inputs_s': round(t_in, 2), 'total_s': round(time.time() - t0, 2), 'stages': stages}}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def stems(**p) -> dict:
+async def mix_piece(**p) -> dict:
     try:
-        return await asyncio.get_running_loop().run_in_executor(_cpu, stems_blocking, p)
+        return await asyncio.get_running_loop().run_in_executor(_cpu, mix_piece_blocking, p)
     except Fail as e:
         return answer_error(e)
 
@@ -321,6 +386,17 @@ def load_separator():
     if not np.isfinite(out).all():  # seen on an RTX 4070 (sm_89, driver 580): the fp16 model returns NaN on CUDA only
         raise RuntimeError(f'separator returns non-finite output on this GPU ({np.isnan(out).mean():.0%} NaN)')
     log.info('separator ready in %.1f s (%s)', time.time() - t, os.path.basename(MODEL))
+    global _ser
+    t = time.time()
+    sys.path.insert(0, str(LAB))
+    from emotion_ser import Ser
+    _ser = Ser()  # E2V_ONNX: the emotion2vec+ large ONNX model in the image
+    if 'CUDAExecutionProvider' not in _ser.sess.get_providers():
+        raise RuntimeError(f'emotion model: CUDA provider not active: {_ser.sess.get_providers()}')
+    probs = _ser.probs_pcm(noise[0, :16000 * 3])
+    if not all(math.isfinite(v) for v in probs.values()):
+        raise RuntimeError('emotion model returns non-finite output on this GPU')
+    log.info('emotion model ready in %.1f s', time.time() - t)
 
 
 @contextlib.asynccontextmanager
@@ -339,16 +415,18 @@ def main():
             log.warning('%s; serving plain HTTP', e)  # as in slim/vast_worker.py
             os.environ['USE_SSL'] = 'false'
     from vastai.serverless.server.worker import BenchmarkConfig, HandlerConfig, Worker, WorkerConfig
-    # Workload is seconds of video: /prepare costs the file length (the backend passes durationMs; its polls pass 1 ms), /stems
-    # the stretch it returns. Only /prepare is benchmarked; a fresh audioHash per run so the disk cache never answers it.
+    # Workload is seconds of video: /prepare costs the file length (the backend passes durationMs; its polls pass 1 ms),
+    # /mix_piece the piece, /ser a second per clip. Only /prepare is benchmarked; a fresh audioHash per run so the disk cache never
+    # answers it.
     bench = BenchmarkConfig(generator=lambda: {'audioUrl': BENCH_URL, 'audioHash': f'bench-{uuid.uuid4().hex[:12]}', 'durationMs': 60000, 'wait': True},
                             runs=2, concurrency=1, do_warmup=False)
     common = dict(is_remote_dispatch=True, allow_parallel_requests=True, max_queue_time=900.0)
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[
         HandlerConfig(route='/prepare', remote_function=prepare, benchmark_config=bench,
                       workload_calculator=lambda p: float(p.get('durationMs') or 600000) / 1000, **common),
-        HandlerConfig(route='/stems', remote_function=stems,
-                      workload_calculator=lambda p: max(1.0, (float(p.get('endMs') or 0) - float(p.get('startMs') or 0)) / 10000), **common)])).run()
+        HandlerConfig(route='/ser', remote_function=ser, workload_calculator=lambda p: float(len(p.get('clips') or {}) or 1), **common),
+        HandlerConfig(route='/mix_piece', remote_function=mix_piece,
+                      workload_calculator=lambda p: float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common)])).run()
 
 
 if __name__ == '__main__':

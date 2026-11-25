@@ -1,5 +1,6 @@
-# studio-prep worker (docs/architecture/studio-dub-realtime.md): Vast PyWorker + Bandit v2 dialogue separation on ONNX Runtime
-# (no PyTorch); the dub itself is built by the studio runner. Every new Vast host pulls the whole image before its first request, so each stage below
+# studio-prep worker (docs/architecture/studio-dub-realtime.md): Vast PyWorker + Bandit v2 dialogue separation and emotion2vec+
+# large on ONNX Runtime (no PyTorch) + the lab's draft mix (lab/, copied from mobile-universal-dubber tool/studio_dub_lab by CI).
+# Every new Vast host pulls the whole image before its first request, so each stage below
 # ships only what the worker runs:
 #   * CUDA/cuDNN: only the libraries ONNX Runtime's CUDA provider loads for this model (cudart, cuBLAS, cuBLASLt, cuFFT, cuRAND,
 #     cuDNN core/ops/adv/graph/heuristic), with GPU code for sm_80/86/89 only (workers are Ampere: the Vast search is
@@ -39,7 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 
 ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # Binaries run on older 12.x drivers through CUDA minor-version compatibility; don't let the image refuse them.
 ENV NVIDIA_DISABLE_REQUIRE=1
-# ffmpeg: decodes the source audio, encodes the opus speech stem and the FLAC stem slices.
+# ffmpeg: decodes the source audio, encodes the opus speech stem, cuts the pieces for the mix.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-distutils ffmpeg libgomp1 ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libopus|aac' | wc -l | grep -qx 2
@@ -49,13 +50,19 @@ RUN ldconfig
 # Build gate: the CUDA provider's libraries resolve (libcuda.so.1 comes from the host driver at run time) and the worker's imports work.
 RUN missing=$(ldd /py/onnxruntime/capi/libonnxruntime_providers_cuda.so | grep 'not found' | grep -v libcuda.so.1); \
     [ -z "$missing" ] || { echo "$missing"; exit 1; }; \
-    python3 -c 'import onnxruntime, numpy, scipy, soundfile, requests, cryptography, vastai.serverless.server.worker'
-# Bandit v2 speech branch (CC BY-SA 4.0, see NOTICE-BANDIT.txt); CI downloads it from a release asset into models/.
+    python3 -c 'import onnxruntime, numpy, scipy, soundfile, nara_wpe, requests, cryptography, vastai.serverless.server.worker'
+# Bandit v2 speech branch (CC BY-SA 4.0, see NOTICE-BANDIT.txt) and emotion2vec+ large; CI downloads them from release assets
+# into models/.
 COPY NOTICE-BANDIT.txt /app/
 COPY models/ /app/models/
-ENV STUDIO_MODEL=/app/models/bandit_speech.onnx STUDIO_CACHE_DIR=/var/studio-cache STUDIO_CACHE_GB=40
+ENV STUDIO_MODEL=/app/models/bandit_speech.onnx E2V_ONNX=/app/models/emotion2vec STUDIO_CACHE_DIR=/var/studio-cache STUDIO_CACHE_GB=40
 # BLAS / OpenMP would otherwise start one thread per host core (20+ on big hosts) in every process.
 ENV OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+# The lab code, unchanged (LAB_REF: its commit). Build gate: the mix and the emotion model import.
+COPY lab/ /app/lab/
+ENV STUDIO_LAB=/app/lab
+RUN cd /app/lab && python3 -c 'import mix_clip, dub_mix, channel_match, recording_defects, room_layers, perspective, netflix_channel, emotion_ser' \
+ && cat LAB_REF
 COPY __init__.py sep.py vast_worker.py /app/studio/
 COPY assets/ /app/studio/assets/
 ENTRYPOINT ["/bin/sh","-c","cd /app && exec python3 -u -m studio.vast_worker"]
