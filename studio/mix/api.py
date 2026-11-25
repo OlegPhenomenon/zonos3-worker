@@ -31,10 +31,12 @@ def part_cues(stems_dir, parts):
     return cues.part_cues(stems_dir, parts, load_docs(stems_dir)["meta"]["activity_thr_db"])
 
 
-def render_segment(stems_dir, segment, segment_ms, parts):
+def render_segment(stems_dir, segment, segment_ms, parts, nonverbal=()):
     """parts: [{id, startMs, endMs, speaker, tempo, placeStartMs, take: WAV bytes, gender?: "male"|"female"|None}] (original slot, PSOLA tempo, placement
-    of the stretched take, gender of the voice: its tone filter is measured against that gender's dry reference). Returns Ogg Opus bytes (audio/ogg, encode.py), stereo 48 kHz, decoding to exactly the window [segment * segment_ms, +segment_ms) of the clip
+    of the stretched take, gender of the voice: its tone filter is measured against that gender's dry reference). nonverbal: [[startMs, endMs]] of
+    the clip where the original's speech stem carries laughs / breaths and no words (decided by the dub pipeline); only those come back from the
+    original voice. Returns Ogg Opus bytes (audio/ogg, encode.py), stereo 48 kHz, decoding to exactly the window [segment * segment_ms, +segment_ms) of the clip
     (the last window shorter). Parts whose reverb tail reaches into the window must be included (analyze() returns their reach as "mixTailMs"); raises
     NotPrepared when the clip was not analysed."""
-    pcm, pre, post, _ = render.render_pcm(stems_dir, segment, segment_ms, parts, context=True)
+    pcm, pre, post, _ = render.render_pcm(stems_dir, segment, segment_ms, parts, context=True, nonverbal=nonverbal)
     return encode_opus(pcm, pre, post)

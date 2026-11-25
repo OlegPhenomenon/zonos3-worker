@@ -4,7 +4,7 @@ on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dis
 Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answer}):
   /prepare {audioUrl, audioHash}        -> {audioHash, durationMs, speechSpans, speechStem, timings, cached}
   /cues    {audioHash, parts}           -> {audioHash, parts: {id: {pitch_st, range_st, loud_db, rate_sps, clip_ogg}}, speakers: {spk: b64}}
-  /mix     {audioHash, segment, segmentMs, parts} -> {segment, audio, timings}
+  /mix     {audioHash, segment, segmentMs, parts, nonverbal?: [[startMs, endMs]]} -> {segment, audio, timings}
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), mix_unavailable
 (studio.mix.api is missing), too_long, download_failed, prepare_failed, mix_failed.
@@ -313,12 +313,13 @@ def mix_blocking(p: dict) -> dict:
     try:
         segment, segment_ms = int(p['segment']), int(p['segmentMs'])
         parts = [{**x, 'take': base64.b64decode(x['take'])} for x in parts]
+        nonverbal = [(int(a), int(b)) for a, b in p.get('nonverbal') or []]
     except (KeyError, TypeError, ValueError) as e:
         raise Fail('bad_request', repr(e))
     s = time.time()
     with using(d.name):
         try:
-            m4a = mix_api.render_segment(d, segment, segment_ms, parts)
+            m4a = mix_api.render_segment(d, segment, segment_ms, parts, nonverbal)
         except NotPrepared as e:
             raise Fail('not_prepared', e)
         except Exception as e:

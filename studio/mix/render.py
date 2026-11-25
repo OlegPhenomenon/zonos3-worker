@@ -14,15 +14,11 @@ import multiprocessing as mp
 import numpy as np
 
 from . import levels, master, netflix, perspective, room_tone, take, taketone
-from .core import SR, Clip, frame_db, frame_power, read_range, runs
+from .core import SR, Clip, frame_power, read_range
 
 ROLL_S = 2.0
 NONVERBAL_GAIN = 0.8
-NONVERBAL_RANGE_S = (0.25, 1.5)  # a speech-activity run with no part on it that long is a laugh / breath, shorter is a speck, longer is
-# speech the transcript missed (it must not leak back in the original language)
-NONVERBAL_EXCLUDE_S = 0.12  # margin around every part
 NONVERBAL_FADE_S = 0.03
-BRIDGE_S = 0.2
 VOICE_LIMIT_RELEASE_MS = 80.0
 PSOLA_WORKERS = 4
 MAX_PART_S = 20.0  # longest dub part: parts that started earlier than this plus the tail before the window cannot reach it
@@ -66,24 +62,16 @@ def _add(dst, x, pos):
         dst[..., a:a + seg.shape[-1]] += seg
 
 
-def _nonverbal(speech2, parts, thr_db, n):
-    """Sounds on the speech stem that carry no words: speech activity outside every part (+- margin), runs of NONVERBAL_RANGE_S."""
-    nf = n // (SR // 100)
-    on = frame_db(0.5 * (speech2[0] + speech2[1])) > thr_db
-    out = on.copy()
-    for a, b in runs(~on):  # bridge short gaps like spans.activity
-        if b - a < int(BRIDGE_S * 100) and a > 0 and b < len(on):
-            out[a:b] = True
-    for p in parts:
-        out[max(0, int((p["o0"] - NONVERBAL_EXCLUDE_S) * 100)):max(0, int((p["o1"] + NONVERBAL_EXCLUDE_S) * 100)) + 1] = False
-    keep = np.zeros(nf, bool)
-    for a, b in runs(out):
-        if NONVERBAL_RANGE_S[0] * 100 <= b - a <= NONVERBAL_RANGE_S[1] * 100:
-            keep[a:b] = True
-    if not keep.any():
-        return None
+def _nonverbal(speech2, spans_ms, t0s, n):
+    """Laughs, breaths and gasps of the original: the speech stem inside the spans the dub pipeline found to carry no words
+    (every word and diarized speech segment excluded, so no original-language speech leaks back). No spans, no sound."""
     env = np.zeros(n, np.float32)
-    env[: nf * (SR // 100)] = np.repeat(keep.astype(np.float32), SR // 100)
+    for a_ms, b_ms in spans_ms:
+        a, b = int(round((a_ms / 1000 - t0s) * SR)), int(round((b_ms / 1000 - t0s) * SR))
+        if b > 0 and a < n:
+            env[max(0, a):min(n, b)] = 1.0
+    if not env.any():
+        return None
     w = int(NONVERBAL_FADE_S * SR)
     c = np.concatenate([[0.0], np.cumsum(env, dtype=np.float64)])
     sm = ((c[w:] - c[:-w]) / w).astype(np.float32)
@@ -95,7 +83,7 @@ CONTEXT_PRE = 40 * SR // 1000  # mastered samples before / after the window that
 CONTEXT_POST = 20 * SR // 1000
 
 
-def render_pcm(stems_dir, segment, segment_ms, parts, context=False):
+def render_pcm(stems_dir, segment, segment_ms, parts, context=False, nonverbal=()):
     """The window as (2, n) float32 at SR (n = the window's length: segment_ms, shorter for the last window) and a timings dict.
     context=True returns (pcm, pre, post, timings): pre / post = the mastered audio just before / after the window (same master
     gain and limiter as the window; None at the start / end of the clip, shorter when less is available)."""
@@ -179,7 +167,7 @@ def render_pcm(stems_dir, segment, segment_ms, parts, context=False):
     t = time.perf_counter()
     g_duck = master.duck_curve(p_orig, p_bg, voice, bg2, lp)
     mixed = levels.apply(bg2, -g_duck) + voice
-    nv = _nonverbal(stem2, lp, meta["activity_thr_db"], n)
+    nv = _nonverbal(stem2, nonverbal, t0s, n)
     if nv is not None:
         mixed += nv
     mixed += netflix.bed_window(room_tone.bed_window(docs["tone"], w0, n), plan, t0s)
