@@ -58,7 +58,7 @@ class Separator:
             providers = [('CUDAExecutionProvider', {'arena_extend_strategy': 'kSameAsRequested'}), 'CPUExecutionProvider']
         self.sess = ort.InferenceSession(str(model_path), so, providers=providers)
         self.hop = int(float(hop_s or os.environ.get('SEP_HOP_S', 4)) * FS)
-        self.batch = int(batch or os.environ.get('SEP_BATCH', 8))
+        self.batch = int(batch or os.environ.get('SEP_BATCH', 2))
         self.window = (np.hanning(CHUNK + 1)[:-1] / (CHUNK / (2 * self.hop))).astype(np.float32)
         self.inputs = [i.name for i in self.sess.get_inputs()]
         self.dtype = np.float16 if 'float16' in self.sess.get_inputs()[0].type else np.float32
@@ -83,6 +83,8 @@ class Separator:
             for i in range(0, len(items), self.batch):
                 part = items[i:i + self.batch]
                 seg = np.stack([xp[c, k * self.hop:k * self.hop + CHUNK] for c, k in part])
+                if len(part) < self.batch:  # a fixed batch shape: cuDNN/ORT keep one set of workspaces instead of one per size
+                    seg = np.concatenate([seg, np.zeros((self.batch - len(part), CHUNK), np.float32)])
                 s = stft(seg)
                 q.put((part, np.ascontiguousarray(s.real).astype(self.dtype), np.ascontiguousarray(s.imag).astype(self.dtype)))
             q.put(None)
@@ -93,7 +95,7 @@ class Separator:
         while (job := q.get()) is not None:
             part, re, im = job
             o_re, o_im = self.sess.run(None, {self.inputs[0]: re, self.inputs[1]: im})
-            y = istft(o_re.astype(np.float32), o_im.astype(np.float32)) * self.window
+            y = istft(o_re[:len(part)].astype(np.float32), o_im[:len(part)].astype(np.float32)) * self.window
             for (c, k), yy in zip(part, y):
                 out[c, k * self.hop:k * self.hop + CHUNK] += yy
             done += len(part)

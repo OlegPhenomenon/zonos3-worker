@@ -348,6 +348,11 @@ def load_separator():
     import numpy as np
     _sep.speech(np.zeros((2, 10 * 48000), np.float32))  # cuDNN algorithm selection and allocator warm-up
     log.info('separator ready in %.1f s (%s)', time.time() - t, os.path.basename(MODEL))
+    if mix_api is not None:  # numba kernels, the analysis process pool and the reference signal, once (3-4 s), not on the first /prepare
+        t = time.time()
+        from studio.mix import channel
+        channel.prepare()
+        log.info('mix library ready in %.1f s', time.time() - t)
 
 
 @contextlib.asynccontextmanager
