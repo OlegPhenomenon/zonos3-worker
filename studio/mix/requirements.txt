@@ -1,7 +1,0 @@
-numpy
-scipy
-soundfile
-praat-parselmouth
-nara_wpe
-numba
-threadpoolctl

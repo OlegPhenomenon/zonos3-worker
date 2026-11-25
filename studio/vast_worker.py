@@ -1,16 +1,17 @@
 """Vast.ai Serverless mode, the studio-prep worker (docs/architecture/studio-dub-realtime.md): the Vast PyWorker (vastai SDK)
-on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dispatch like slim/vast_worker.py.
+on WORKER_PORT (3000, TLS with the Vast-signed instance certificate), remote dispatch like slim/vast_worker.py. It separates the
+dialogue from the rest of a video's sound on the GPU and serves the stems; the dub itself is built by the studio runner.
 
 Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answer}):
-  /prepare {audioUrl, audioHash}        -> {"pending": true} while the file is being prepared in the background (ask again),
-                                           then {audioHash, durationMs, speechSpans, speechStem, timings, cached}
-  /cues    {audioHash, parts}           -> {audioHash, parts: {id: {pitch_st, range_st, loud_db, rate_sps, clip_ogg}}, speakers: {spk: b64}}
-  /mix     {audioHash, segment, segmentMs, parts, nonverbal?: [[startMs, endMs]]} -> {segment, audio, timings}
+  /prepare {audioUrl, audioHash}        -> {"pending": true} while the file is being separated in the background (ask again),
+                                           then {audioHash, durationMs, speechStem, timings, cached}
+  /stems   {audioHash, startMs, endMs}  -> {audioHash, startMs, endMs, speech, bg}: that stretch of the stems as FLAC
+                                           (speech mono, bg stereo, 44.1 kHz 16 bit)
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
-a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), mix_unavailable
-(studio.mix.api is missing), too_long, download_failed, prepare_failed, mix_failed.
+a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
+download_failed, prepare_failed, stems_failed.
 
-Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json, analysis/}, least recently used evicted
+Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json}, least recently used evicted
 above STUDIO_CACHE_GB (default 40). The directory appears atomically (renamed from <hash>.tmp) only after a complete prepare.
 """
 import asyncio, base64, contextlib, ipaddress, json, logging, os, re, shutil, subprocess, threading, time, uuid
@@ -30,17 +31,8 @@ MODEL = os.environ.get('STUDIO_MODEL', '/app/models/bandit_speech.onnx')
 MAX_AUDIO_S = float(os.environ.get('STUDIO_MAX_AUDIO_MIN', '180')) * 60  # RAM: the separator holds ~4 float32 copies of the stereo mix
 DOWNLOAD_TIMEOUT_S = int(os.environ.get('STUDIO_DOWNLOAD_TIMEOUT_S', '300'))
 HASH_RE = re.compile(r'^[A-Za-z0-9_-]{6,128}$')
-BENCH_URL = 'bench:'  # the Vast startup benchmark: the first minute of the mix library's dry speech reference, no download
-
-try:
-    from studio.mix import api as mix_api
-    from studio.mix.api import NotPrepared
-    MIX_ERROR = None
-except Exception as e:  # missing or broken mix library: /prepare, /cues and /mix answer mix_unavailable, the worker stays up
-    mix_api, MIX_ERROR = None, repr(e)
-
-    class NotPrepared(Exception):
-        pass
+BENCH_URL = 'bench:'  # the Vast startup benchmark: the first minute of a bundled clip, no download
+MAX_STEMS_S = 300     # longest stretch /stems returns in one answer
 
 _sep = None
 _gpu = threading.Lock()      # one separation at a time: the model owns the card
@@ -160,19 +152,10 @@ def need_hash(p: dict) -> str:
 
 
 def need_prepared(p: dict) -> Path:
-    if mix_api is None:
-        raise Fail('mix_unavailable', MIX_ERROR)
     d = stems_dir(need_hash(p))
     if not (d / 'prepare.json').exists():
         raise Fail('not_prepared', p['audioHash'])
     return d
-
-
-def need_parts(p: dict) -> list:
-    parts = p.get('parts')
-    if not isinstance(parts, list):
-        raise Fail('bad_request', 'parts must be a list')
-    return parts
 
 
 # ---------------------------------------------------------------- /prepare
@@ -185,7 +168,7 @@ def run(cmd: list[str], what: str, timeout: float) -> None:
 def download(url: str, dst: Path) -> None:
     """Decode the audio at `url` to stereo 48 kHz FLAC. Only http(s) is followed; the reference clip for the startup benchmark is local."""
     if url.startswith(BENCH_URL):
-        ref = Path(__file__).parent / 'mix' / 'assets' / 'dry_reference.flac'
+        ref = Path(__file__).parent / 'assets' / 'bench.flac'
         cmd = ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-t', '60', '-i', str(ref), '-ac', '2', '-ar', '48000', '-c:a', 'flac', str(dst)]
     elif url.startswith(('https://', 'http://')):
         cmd = ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-protocol_whitelist', 'http,https,tcp,tls,crypto',
@@ -237,19 +220,10 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
             sep.separate_file(tmp / 'mix.flac', tmp, _sep)
         t['separate_s'] = round(time.time() - s, 2)
         s = time.time()
-        th = threading.Thread(target=lambda: encode_stem(tmp / 'speech.flac', tmp / 'speech.opus'))
-        th.start()  # the opus encode runs beside the analysis
-        spans = [[int(a), int(b)] for a, b in mix_api.speech_spans(tmp)]
-        t['spans_s'] = round(time.time() - s, 2)
-        s = time.time()
-        stage = mix_api.analyze(tmp)
-        t['analyze_s'] = round(time.time() - s, 2)
-        th.join()
-        if not (tmp / 'speech.opus').exists():
-            raise Fail('prepare_failed', 'speech stem encode failed')
-        t['analyze_stages'] = stage
+        encode_stem(tmp / 'speech.flac', tmp / 'speech.opus')
+        t['encode_s'] = round(time.time() - s, 2)
         t['total_s'] = round(time.time() - t0, 2)
-        (tmp / 'prepare.json').write_text(json.dumps({'durationMs': dur, 'speechSpans': spans, 'timings': t}))
+        (tmp / 'prepare.json').write_text(json.dumps({'durationMs': dur, 'timings': t}))
         shutil.rmtree(final, ignore_errors=True)
         tmp.rename(final)
     except Fail:
@@ -264,22 +238,20 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
 
 def answer_prepared(d: Path, cached: bool) -> dict:
     meta = json.loads((d / 'prepare.json').read_text())
-    return {'audioHash': d.name, 'durationMs': meta['durationMs'], 'speechSpans': meta['speechSpans'],
+    return {'audioHash': d.name, 'durationMs': meta['durationMs'],
             'speechStem': base64.b64encode((d / 'speech.opus').read_bytes()).decode(), 'timings': meta['timings'], 'cached': cached}
 
 
 def prepare_in_use(url: str, audio_hash: str) -> dict:
-    with _prepare_slot, using(audio_hash):  # one preparation at a time: two analyses side by side exhaust the host's threads
+    with _prepare_slot, using(audio_hash):  # one preparation at a time
         return prepare_blocking(url, audio_hash)
 
 
 async def prepare(**p) -> dict:
-    """Starts the preparation of a new audio file in the background and answers {"pending": true} at once; the caller asks
-    again (same worker) until the answer is the prepared file. A 10-min file takes about a minute, longer than a proxied
+    """Starts the separation of a new audio file in the background and answers {"pending": true} at once; the caller asks
+    again (same worker) until the answer is the prepared file. A 10-min file takes about 40 s, longer than a proxied
     request may stay open, so the call itself never waits for it."""
     try:
-        if mix_api is None:
-            raise Fail('mix_unavailable', MIX_ERROR)
         h = need_hash(p)
         url = p.get('audioUrl')
         if not isinstance(url, str) or not url:
@@ -300,55 +272,34 @@ async def prepare(**p) -> dict:
         return answer_error(e)
 
 
-# ---------------------------------------------------------------- /cues, /mix
-def cues_blocking(p: dict) -> dict:
+# ---------------------------------------------------------------- /stems
+def flac_slice(src: Path, start_s: float, end_s: float, channels: int) -> bytes:
+    r = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', f'{start_s:.3f}', '-to', f'{end_s:.3f}', '-i', str(src),
+                        '-ac', str(channels), '-ar', '44100', '-sample_fmt', 's16', '-c:a', 'flac', '-f', 'flac', '-'],
+                       capture_output=True, timeout=120)
+    if r.returncode:
+        raise Fail('stems_failed', r.stderr.decode(errors='replace')[-300:])
+    return r.stdout
+
+
+def stems_blocking(p: dict) -> dict:
     d = need_prepared(p)
-    parts = need_parts(p)
-    with using(d.name):
-        try:
-            r = mix_api.part_cues(d, parts)
-        except NotPrepared as e:
-            raise Fail('not_prepared', e)
-        except Exception as e:
-            log.exception('cues failed')
-            raise Fail('mix_failed', repr(e))
-    b64 = lambda b: base64.b64encode(b).decode()
-    return {'audioHash': d.name,
-            'parts': {k: {**{f: x for f, x in v.items() if f != 'clip_ogg'}, 'clip_ogg': b64(v['clip_ogg'])} for k, v in r['parts'].items()},
-            'speakers': {k: b64(v) for k, v in r['speakers'].items()}}
-
-
-async def cues(**p) -> dict:
     try:
-        return await asyncio.get_running_loop().run_in_executor(_cpu, cues_blocking, p)
-    except Fail as e:
-        return answer_error(e)
-
-
-def mix_blocking(p: dict) -> dict:
-    d = need_prepared(p)
-    parts = need_parts(p)
-    try:
-        segment, segment_ms = int(p['segment']), int(p['segmentMs'])
-        parts = [{**x, 'take': base64.b64decode(x['take'])} for x in parts]
-        nonverbal = [(int(a), int(b)) for a, b in p.get('nonverbal') or []]
+        a, b = int(p['startMs']), int(p['endMs'])
     except (KeyError, TypeError, ValueError) as e:
         raise Fail('bad_request', repr(e))
-    s = time.time()
+    if not 0 <= a < b or b - a > MAX_STEMS_S * 1000:
+        raise Fail('bad_request', f'need 0 <= startMs < endMs and at most {MAX_STEMS_S} s')
     with using(d.name):
-        try:
-            m4a = mix_api.render_segment(d, segment, segment_ms, parts, nonverbal)
-        except NotPrepared as e:
-            raise Fail('not_prepared', e)
-        except Exception as e:
-            log.exception('mix failed')
-            raise Fail('mix_failed', repr(e))
-    return {'segment': segment, 'audio': base64.b64encode(m4a).decode(), 'timings': {'render_s': round(time.time() - s, 2)}}
+        speech = flac_slice(d / 'speech.flac', a / 1000, b / 1000, 1)
+        bg = flac_slice(d / 'bg.flac', a / 1000, b / 1000, 2)
+    return {'audioHash': d.name, 'startMs': a, 'endMs': b,
+            'speech': base64.b64encode(speech).decode(), 'bg': base64.b64encode(bg).decode()}
 
 
-async def mix(**p) -> dict:
+async def stems(**p) -> dict:
     try:
-        return await asyncio.get_running_loop().run_in_executor(_cpu, mix_blocking, p)
+        return await asyncio.get_running_loop().run_in_executor(_cpu, stems_blocking, p)
     except Fail as e:
         return answer_error(e)
 
@@ -367,11 +318,6 @@ def load_separator():
     import numpy as np
     _sep.speech(np.zeros((2, 10 * 48000), np.float32))  # cuDNN algorithm selection and allocator warm-up
     log.info('separator ready in %.1f s (%s)', time.time() - t, os.path.basename(MODEL))
-    if mix_api is not None:  # numba kernels, the analysis process pool and the reference signal, once (3-4 s), not on the first /prepare
-        t = time.time()
-        from studio.mix import channel
-        channel.prepare()
-        log.info('mix library ready in %.1f s', time.time() - t)
 
 
 @contextlib.asynccontextmanager
@@ -390,17 +336,16 @@ def main():
             log.warning('%s; serving plain HTTP', e)  # as in slim/vast_worker.py
             os.environ['USE_SSL'] = 'false'
     from vastai.serverless.server.worker import BenchmarkConfig, HandlerConfig, Worker, WorkerConfig
-    # Workload is seconds of video: /prepare costs the file length (the backend may pass durationMs, else a 10 min typical file),
-    # a /mix window or /cues call a fixed slice. Only /prepare is benchmarked (the others need a prepared file); a fresh audioHash
-    # per run so the disk cache never answers the benchmark.
+    # Workload is seconds of video: /prepare costs the file length (the backend passes durationMs; its polls pass 1 ms), /stems
+    # the stretch it returns. Only /prepare is benchmarked; a fresh audioHash per run so the disk cache never answers it.
     bench = BenchmarkConfig(generator=lambda: {'audioUrl': BENCH_URL, 'audioHash': f'bench-{uuid.uuid4().hex[:12]}', 'durationMs': 60000, 'wait': True},
                             runs=2, concurrency=1, do_warmup=False)
     common = dict(is_remote_dispatch=True, allow_parallel_requests=True, max_queue_time=900.0)
     Worker(WorkerConfig(lifecycle=lifecycle(), handlers=[
         HandlerConfig(route='/prepare', remote_function=prepare, benchmark_config=bench,
                       workload_calculator=lambda p: float(p.get('durationMs') or 600000) / 1000, **common),
-        HandlerConfig(route='/cues', remote_function=cues, workload_calculator=lambda p: 5.0, **common),
-        HandlerConfig(route='/mix', remote_function=mix, workload_calculator=lambda p: 20.0, **common)])).run()
+        HandlerConfig(route='/stems', remote_function=stems,
+                      workload_calculator=lambda p: max(1.0, (float(p.get('endMs') or 0) - float(p.get('startMs') or 0)) / 10000), **common)])).run()
 
 
 if __name__ == '__main__':

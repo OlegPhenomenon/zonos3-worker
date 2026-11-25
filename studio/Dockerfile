@@ -1,5 +1,5 @@
 # studio-prep worker (docs/architecture/studio-dub-realtime.md): Vast PyWorker + Bandit v2 dialogue separation on ONNX Runtime
-# (no PyTorch) + the studio mix library. Every new Vast host pulls the whole image before its first request, so each stage below
+# (no PyTorch); the dub itself is built by the studio runner. Every new Vast host pulls the whole image before its first request, so each stage below
 # ships only what the worker runs:
 #   * CUDA/cuDNN: only the libraries ONNX Runtime's CUDA provider loads for this model (cudart, cuBLAS, cuBLASLt, cuFFT, cuRAND,
 #     cuDNN core/ops/adv/graph/heuristic), with GPU code for sm_80/86/89 only (workers are Ampere/Ada: the Vast search is
@@ -39,7 +39,7 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 
 ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # Binaries run on older 12.x drivers through CUDA minor-version compatibility; don't let the image refuse them.
 ENV NVIDIA_DISABLE_REQUIRE=1
-# ffmpeg: decodes the source audio, encodes the opus speech stem and the AAC windows (libopus, native aac).
+# ffmpeg: decodes the source audio, encodes the opus speech stem and the FLAC stem slices.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-distutils ffmpeg libgomp1 ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libopus|aac' | wc -l | grep -qx 2
@@ -49,16 +49,13 @@ RUN ldconfig
 # Build gate: the CUDA provider's libraries resolve (libcuda.so.1 comes from the host driver at run time) and the worker's imports work.
 RUN missing=$(ldd /py/onnxruntime/capi/libonnxruntime_providers_cuda.so | grep 'not found' | grep -v libcuda.so.1); \
     [ -z "$missing" ] || { echo "$missing"; exit 1; }; \
-    python3 -c 'import onnxruntime, numpy, scipy, soundfile, parselmouth, numba, nara_wpe, threadpoolctl, requests, cryptography, vastai.serverless.server.worker'
+    python3 -c 'import onnxruntime, numpy, scipy, soundfile, requests, cryptography, vastai.serverless.server.worker'
 # Bandit v2 speech branch (CC BY-SA 4.0, see NOTICE-BANDIT.txt); CI downloads it from a release asset into models/.
 COPY NOTICE-BANDIT.txt /app/
 COPY models/ /app/models/
 ENV STUDIO_MODEL=/app/models/bandit_speech.onnx STUDIO_CACHE_DIR=/var/studio-cache STUDIO_CACHE_GB=40
-# Every process of the mix pools would otherwise start one BLAS / OpenMP / numba thread per host core (20+ on big hosts):
-# with the pools and a running separation that runs into the host's thread limit and kills the worker.
-ENV OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMBA_NUM_THREADS=4
+# BLAS / OpenMP would otherwise start one thread per host core (20+ on big hosts) in every process.
+ENV OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 COPY __init__.py sep.py vast_worker.py /app/studio/
-COPY mix/ /app/studio/mix/
-# Build gate for the mix library; numba compiles its kernels once here (cache in studio/mix/__pycache__) instead of on the first request.
-RUN cd /app && python3 -c 'from studio.mix import api, channel; channel.prepare()'
+COPY assets/ /app/studio/assets/
 ENTRYPOINT ["/bin/sh","-c","cd /app && exec python3 -u -m studio.vast_worker"]
