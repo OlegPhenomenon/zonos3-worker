@@ -5,9 +5,13 @@ ZONOS3-Mini TTS worker for Vast.ai Serverless (production) and RunPod Serverless
 ## Image (`slim/`)
 
 One image, `ghcr.io/olegphenomenon/zonos3-worker:runpod-slim-<sha>` (public), built by `.github/workflows/slim.yml`
-without compiling: Ubuntu + the CUDA libraries the server links (cudart, cublas, nccl) + ffmpeg + prebuilt `zonos3-server` (release `ggml-cuda-sm86-sm89-96d9e0e`, Ampere/Ada)
-+ `backbone-ptq.gguf`, `zac-keep2.gguf`, `spk-encoder.gguf` (~1.2 GB) + the voice bank clips (Opus, ~33 MB).
-Argument `vast` starts the Vast PyWorker (port 3000, route `/tts`); no argument starts the RunPod handler.
+without compiling: Ubuntu + the CUDA libraries the server links (cudart, cublas, cublasLt; GPU code for sm_80/86/89 only, NCCL replaced by a stub
+because every worker has one GPU) + a 2 MB ffmpeg with just the audio decoders (`zonos3-server` shells out to it for voice clips; the build checks it
+bit for bit against Ubuntu's ffmpeg on every clip) + prebuilt `zonos3-server` (release `ggml-cuda-sm86-sm89-96d9e0e`, Ampere/Ada)
++ `backbone-ptq.gguf`, `zac-keep2.gguf`, `spk-encoder.gguf`, `steer.gguf` (~1.2 GB) + the voice bank clips (Opus, ~33 MB). Python carries only what the
+PyWorker imports (no pip, no `vastai` CLI/SDK tree, see the `pydeps` stage).
+Argument `vast` starts the Vast PyWorker (port 3000, route `/tts`); no argument starts the RunPod handler, which needs
+`docker build --build-arg RUNPOD=1` (the `runpod` package is not in the default image).
 
 Request payload (Vast: `{"auth_data": <route answer>, "payload": {...}}`; RunPod: `input`):
 
