@@ -47,3 +47,12 @@ and its workergroup: cheap 8–24 GB Ampere/Ada cards under `VAST_MAX_DPH` (defa
 different hosts with the image already pulled are kept as the cache (`cold_workers=3`, storage-only billing); the next
 worker wakes at 70% load (`target_util`); active workers stop after 120 s without traffic. Capacity and latency:
 `research/loadtest.py` (one RTX 4070: ~36 s of audio per second, ~20 dubbing viewers).
+
+Switching the image without template rights works only for a workergroup that has no template: `PUT /api/v0/workergroups/<id>/` with
+`{"client_id":"me","autojob_id":<id>,"endpoint_id":<eid>,"endpoint_name":"…","launch_args":"--image ghcr.io/olegphenomenon/zonos3-worker:<tag> --env '-p 3000:3000' --disk 16 --onstart-cmd 'cd /app && exec python3 -u vast_worker.py'"}`
+answers `{"success": true}` and Vast recycles the workers onto that image (this is how `zonos3-tts-emo`, 46194, runs). On a workergroup that
+has a template (prod `zonos3-tts`, workergroup 55211, template `5fcead05…`) the template's image wins and `launch_args` does not change it
+(tested 2026-11-25: workers were rebuilt on the old tag); with `--onstart-cmd` the template's `args` runtype breaks container creation.
+Prod therefore needs `scripts/vast_setup.sh <tag>` with a key that may write templates. The slim image `runpod-slim-a88e1e7971d6b9555f196ddbd43e0c3e07078c46`
+(1.3 GB compressed against 2.4 GB for `runpod-slim-72cb61ef99fc75c7801fc7d7e74b535d3d6d4adf`) gives byte-identical audio to the old image
+on the same GPU model (19 requests each on RTX 4060 Ti, RTX 3060, RTX A4000).
