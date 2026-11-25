@@ -46,6 +46,8 @@ _gpu = threading.Lock()      # one separation at a time: the model owns the card
 _cpu = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 2, 4), thread_name_prefix='studio-cpu')
 _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
 _prepare_slot = threading.Lock()
+# Pieces mixed at once: each mix runs its WPE dereverberation on 6 processes; a Vast container gets ~15 cores of a big host.
+_mix_slots = threading.Semaphore(int(os.environ.get('STUDIO_MIXES', '3')))
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
 _cache_lock = threading.Lock()
 
