@@ -120,7 +120,7 @@ def render_pcm(stems_dir, segment, segment_ms, parts):
         o1 = max(p["endMs"] / 1000, o0 + 0.2)
         d1 = max(d0 + 0.2, d0 + len(x) / SR)
         lp.append({"o0": o0 - t0s, "o1": o1 - t0s, "d0": d0 - t0s, "d1": d1 - t0s, "err": d0 + len(x) / SR - p["endMs"] / 1000,
-                   "pos": int(round((d0 - t0s) * SR)), "x": x, "speaker": p["speaker"], "o0_abs": o0, "o1_abs": o1})
+                   "pos": int(round((d0 - t0s) * SR)), "x": x, "speaker": p["speaker"], "gender": p.get("gender"), "o0_abs": o0, "o1_abs": o1})
     lp = [q for q in lp if q["pos"] + len(q["x"]) + int(reach * SR) > 0 and q["pos"] < n]
 
     # --- the original of this window
@@ -148,7 +148,7 @@ def render_pcm(stems_dir, segment, segment_ms, parts):
         later = [s for s in order if s > q["o0_abs"] + 1e-6]
         cue = perspective.part_cue(clip, docs["persp"], q["o0_abs"], q["o1_abs"], later[0] if later else None)
         q["cue"] = cue
-        _add(voice, netflix.render_part(plan, x, 0.5 * (q["o0_abs"] + q["o1_abs"]), cue), q["pos"])
+        _add(voice, netflix.render_part(plan, x, 0.5 * (q["o0_abs"] + q["o1_abs"]), cue, gender=q["gender"]), q["pos"])
     tim["channel"] = time.perf_counter() - t
 
     # --- dynamics of the scenes, level 2, perspective pan

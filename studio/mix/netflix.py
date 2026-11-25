@@ -35,6 +35,8 @@ from . import channel as cm
 from . import core, dynamics, perspective, rooms
 from .locations import MIN_SPEECH_S
 
+GENDERS = core.GENDERS
+
 SR = core.SR
 NFFT = 16384
 TAPS = cm.EQ_TAPS
@@ -44,7 +46,7 @@ TONE_REF_HZ = (300.0, 3000.0)  # the tone filter is normalised over this band (c
 HP_TAPS = 4097
 FADE_S = 0.25  # bed treatment cross-fade at the scene edges
 MIN_DYN_SCENE_S = 1.0  # dynamics are not applied to scenes shorter than this
-MAX_TONE_BOOST_DB = 6.0  # (re the speech-band gain) the tone filter divides the stem's spectrum by the dry REFERENCE voice's, not by the clip's own dub (the lab's
+MAX_TONE_BOOST_DB = 3.0  # (re the speech-band gain) the tone filter divides the stem's spectrum by the dry REFERENCE voice's, not by the clip's own dub (the lab's
 # 6 dB EQ_LIMIT_DB of the early matching EQ): a reference that lacks a band the actual voice has would otherwise boost it by 10-18 dB (panel_en scene 5, 60-115 Hz)
 TAIL_S = rooms.LATE_BANK_S + TAPS / SR  # the longest late layer (the bank) + the tone filter
 
@@ -97,6 +99,20 @@ def layer_sum(a, b):
     return out
 
 
+def _location_tone(firs, w, thin, trt):
+    """The location's tone filter from its member scenes' filters: speech-weighted mean in dB (flat for a thin location), defect edges
+    relaxed, boost capped, minimum phase. Returns (fir, rms spread of the members in dB)."""
+    mags = np.stack([fir_db(f) for f in firs])
+    mag = (mags * w[:, None]).sum(0) / w.sum()  # each member is already normalised over the reference band
+    if thin:  # a handful of seconds cannot fix a tone filter: flat tone
+        mag = np.zeros_like(mag)
+    spread = float(np.sqrt(((mags - mag) ** 2 * w[:, None]).sum() / (w.sum() * mags.shape[1])))
+    mag = relax_edges(mag, trt.get("relax_hp_hz"), trt.get("relax_lp_hz"))
+    band = np.fft.rfftfreq(NFFT, 1 / SR)
+    mag = np.minimum(mag, np.median(mag[(band >= TONE_REF_HZ[0]) & (band <= TONE_REF_HZ[1])]) + MAX_TONE_BOOST_DB)
+    return minphase(mag), spread
+
+
 def build_plan(chan, rooms_doc, defects_doc, locs):
     """Location treatments + the per-scene mapping (module docstring). chan = channel document, rooms_doc = rooms.analyze(),
     defects_doc = defects.analyze(), locs = locations.cluster()."""
@@ -108,29 +124,25 @@ def build_plan(chan, rooms_doc, defects_doc, locs):
         ids = L["scenes"]
         w = np.array([max(L["weights"][str(i)], 1e-3) for i in ids])
         rep = L["rep_scene"]
-        mags = np.stack([fir_db(room_by_id[i]["_fir"]) for i in ids])
-        # tone: speech-weighted mean in dB, each member normalised over the reference band first (they already are)
-        mag = (mags * w[:, None]).sum(0) / w.sum()
-        thin = L["speech_s"] < MIN_SPEECH_S
-        if thin:  # a handful of seconds cannot fix a tone filter: flat tone
-            mag = np.zeros_like(mag)
-        spread = float(np.sqrt(((mags - mag) ** 2 * w[:, None]).sum() / (w.sum() * mags.shape[1])))
         trt = defects[rep]["treatment"]
-        mag = relax_edges(mag, trt.get("relax_hp_hz"), trt.get("relax_lp_hz"))
-        band = np.fft.rfftfreq(NFFT, 1 / SR)
-        mag = np.minimum(mag, np.median(mag[(band >= TONE_REF_HZ[0]) & (band <= TONE_REF_HZ[1])]) + MAX_TONE_BOOST_DB)
+        thin = L["speech_s"] < MIN_SPEECH_S
+        early, late = room_by_id[rep]["_early"], room_by_id[rep]["_late"]
+        tones = {}
+        for g in (None,) + GENDERS:  # the tone against the mixed reference (unknown gender) and against each gender's own voices
+            fir, spread = _location_tone([room_by_id[i]["_fir"] if g is None else room_by_id[i]["_fir_by_gender"][g] for i in ids], w, thin, trt)
+            wet = np.stack([fftconvolve(layer_sum(early[c], late[c]), fir) for c in range(2)]).astype(np.float32)  # once per location
+            tones[g] = {"fir": fir, "wet": wet}
+            if g is None:
+                spread0 = spread
         dyn = scene_by_id[rep].get("dynamics")
         if dyn and not trt.get("copy_dynamics", True):
             dyn = None
-        fir = minphase(mag)
-        early, late = room_by_id[rep]["_early"], room_by_id[rep]["_late"]
-        wet = np.stack([fftconvolve(layer_sum(early[c], late[c]), fir) for c in range(2)]).astype(np.float32)  # once per location
-        locations[L["id"]] = {"fir": fir, "early": early, "late": late, "wet": wet, "dynamics": dyn, "rep": rep, "futz": trt.get("futz"),
-                              "flat_tone": thin, "verdict": defects[rep]["verdict"], "scenes": ids}
+        locations[L["id"]] = {**tones[None], "by_gender": {g: tones[g] for g in GENDERS}, "early": early, "late": late, "dynamics": dyn, "rep": rep,
+                              "futz": trt.get("futz"), "flat_tone": thin, "verdict": defects[rep]["verdict"], "scenes": ids}
         report.append({"location": L["id"], "flat_tone": thin, "scenes": ids, "rep_scene": rep, "verdict": defects[rep]["verdict"], "futz": trt.get("futz"),
-                       "relax_hp_hz": trt.get("relax_hp_hz"), "relax_lp_hz": trt.get("relax_lp_hz"), "tone_spread_db_rms": round(spread, 2),
+                       "relax_hp_hz": trt.get("relax_hp_hz"), "relax_lp_hz": trt.get("relax_lp_hz"), "tone_spread_db_rms": round(spread0, 2),
                        "dynamics": None if not dyn else {k: dyn[k] for k in ("compressor", "saturation")}})
-    tail = max(loc["wet"].shape[1] - 1 for loc in locations.values()) / SR
+    tail = max(t["wet"].shape[1] - 1 for loc in locations.values() for t in (loc, *loc["by_gender"].values())) / SR
     return {"locations": locations, "scene_location": {int(s): l for s, l in locs["scene_to_location"].items()},
             "scenes": [(s["id"], s["start"], s["end"]) for s in chan["scenes"]],
             "bed": {sid: bed_treatment(d["treatment"].get("bed")) for sid, d in defects.items()}, "tail_s": tail, "report": report}
@@ -146,7 +158,7 @@ def location_at(plan, t):
 
 # ----------------------------------------------------------------------------- one part
 
-def render_part(plan, seg, t_mid_s, cue, workers=1):
+def render_part(plan, seg, t_mid_s, cue, workers=1, gender=None):
     """One dub part: the dry mono take `seg` (n,) at SR that belongs to original time t_mid_s -> (2, n + tail) float32. Tilt
     (cue["tilt_db"]), direct = fir * seg, wet = (early + late) * fir * seg scaled by 10 ** (cue["wet_db"] / 20), summed and
     normalised to the RMS of seg over the first len(seg) samples (the part keeps its own level; level is the mixer's job).
@@ -156,6 +168,7 @@ def render_part(plan, seg, t_mid_s, cue, workers=1):
     if n < 2 or not x.any():
         return np.zeros((2, n), np.float32)
     loc = location_at(plan, t_mid_s)
+    loc = loc["by_gender"].get(gender, loc)  # the tone / wet filters of the speaker's gender (unknown: against the mixed reference)
     if cue.get("tilt_db"):
         x = perspective.tilt_filter(x, cue["tilt_db"], SR)
     wet = loc["wet"]

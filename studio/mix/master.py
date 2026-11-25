@@ -23,7 +23,7 @@ from . import loud
 from .core import FR, SR, frame_power
 
 TRUE_PEAK_DB = -2.0  # Netflix sound specification: maximum true peak -2 dBTP
-CEILING_DB = -2.05  # limiter ceiling: leaves 0.05 dB for the measurement tolerance between true-peak meters
+CEILING_DB = -2.6  # limiter ceiling: the AAC encoder overshoots the true peak by 0.6-1.1 dB (measured on the two lab clips), the delivery limit after decode is -1 dBTP
 RELEASE_MS = 80.0
 MAX_HEAVY_LIMIT_S = 1.0  # seconds per minute of programme in which the limiter may take more than 3 dB
 CREST_DB = 2.0  # the dub mix is peakier than the original at equal loudness (lab panel_en: 2.3 s/min over 3 dB where the original mix gives 0);

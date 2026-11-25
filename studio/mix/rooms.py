@@ -25,7 +25,7 @@ API
         {"sr", "floor_coherence" (per octave band or None), "scenes": [{"id","start","end", "early_params","late_params",
           "voice_rt60_s","voice_plausible","voice_reasons","voice_events","me_rt60_s","me_events","me_detail",
           "me_rt60_by_band_s","agreement","agreement_ratio","source","borrowed_from","rho_late","note","n_sims",
-          "early_late_energy_db","corr", "_fir" (taps,), "_early" (2, m), "_late" (2, m)}]}
+          "early_late_energy_db","corr", "_fir" (taps,; tone against the mixed reference), "_fir_by_gender" {"male"|"female": (taps,)}, "_early" (2, m), "_late" (2, m)}]}
         The lab's rooms.json schema; the wav files of the lab are the arrays `_fir`, `_early`, `_late` (WITHOUT the direct pulse;
         application per channel c: y_c = conv(x, fir * (delta + early[c] + late[c]))). A "none" scene has early / late = (2, 1)
         zeros. `chan` = the channel document (scenes with id, start, end, borrowed_from), `regions` = core.speech_regions(speech)
@@ -92,6 +92,7 @@ ME_RISE_DB = 6.0
 ME_GATE_S = 0.100
 
 # ----------------------------------------------------------------------------- speed settings
+TONE_GENDERS = (None,) + core.GENDERS  # tone filters: against the mixed reference (unknown gender), male and female voices
 TONE_REF_S = 45.0  # seconds of the dry reference voice the tone FIR is computed on (core.Reference.excerpt)
 SIM_NFFT_STEP = 12000  # simulation IR lengths are rounded up to this many samples so that FFT sizes (and cached spectra) repeat
 
@@ -800,11 +801,12 @@ def build_room(bank, late_params, early_params, source_none=False):
     return early.astype(np.float32), late.astype(np.float32)
 
 
-def dub_ltas(early, late):
-    """LTAS of the dry reference voice through delta + room (channel 0 of the layers): the dub side of the tone FIR."""
-    if "tone" not in _REF:
-        _REF["tone"] = core.reference().excerpt(TONE_REF_S)
-    x, regs = _REF["tone"]
+def dub_ltas(early, late, gender=None):
+    """LTAS of the dry reference voice (of `gender`, None = the mix) through delta + room (channel 0 of the layers): the dub side of
+    the tone FIR."""
+    if ("tone", gender) not in _REF:
+        _REF[("tone", gender)] = core.reference(gender).excerpt(TONE_REF_S)
+    x, regs = _REF[("tone", gender)]
     h = np.zeros(max(early.shape[1], late.shape[1]), np.float32)
     h[0] = 1.0
     h[:early.shape[1]] += early[0]
@@ -955,8 +957,8 @@ def _fit_job(args):
 
 # ----------------------------------------------------------------------------- clip level
 
-def _dub_ltas_job(room):
-    return dub_ltas(*room)
+def _dub_ltas_job(job):
+    return dub_ltas(*job)
 
 
 def analyze(clip, chan, regions, workers=8, tone=None):
@@ -966,7 +968,8 @@ def analyze(clip, chan, regions, workers=8, tone=None):
     stem = clip.speech
     _G.update(scenes=scenes, n=clip.n, stem=stem, regions=regions, bank=get_bank(rho), rs=reference_sim(),
               stem_db=env_db_parallel(stem, workers), me_env=me_env(clip.bg2.mean(0), workers))
-    dub_ltas(np.zeros((2, 1), np.float32), np.zeros((2, 1), np.float32))  # loads the reference excerpt before the fork
+    for g in TONE_GENDERS:  # loads the reference excerpts before the fork
+        dub_ltas(np.zeros((2, 1), np.float32), np.zeros((2, 1), np.float32), g)
     ctx = mp.get_context("fork")
     with ProcessPoolExecutor(max(1, min(workers, len(scenes))), mp_context=ctx) as ex:
         stats = list(ex.map(_stats_job, range(len(scenes))))
@@ -979,19 +982,20 @@ def analyze(clip, chan, regions, workers=8, tone=None):
         for e in ents.values():
             if not e["few"]:
                 rooms_.setdefault(e["room"], (e["early"], e["late"]))
-        keys = list(rooms_)
-        p_dub = dict(zip(keys, ex.map(_dub_ltas_job, [rooms_[k] for k in keys])))
+        keys = [(k, g) for k in rooms_ for g in TONE_GENDERS]
+        p_dub = dict(zip(keys, ex.map(_dub_ltas_job, [(*rooms_[k], g) for k, g in keys])))
     _G.clear()
     ident = np.zeros(EQ_TAPS, np.float32)
     ident[0] = 1.0
     for e in ents.values():
-        e["fir"] = ident if e["few"] else tone_fir(e["p_stem"], e["p_noise"], p_dub[e["room"]])
+        e["fir"] = {g: ident if e["few"] else tone_fir(e["p_stem"], e["p_noise"], p_dub[(e["room"], g)]) for g in TONE_GENDERS}
     for sc in scenes:  # a scene with fewer than 2 speech regions that borrowed a room takes the donor's tone filter too
         e = ents[sc["id"]]
         if e["few"] and e["rec"]["borrowed_from"] is not None:
             e["fir"] = ents[e["rec"]["borrowed_from"]]["fir"]
     return {"sr": SR, "floor_coherence": None if rho is None else [float(v) for v in rho],
-            "scenes": [dict(ents[sc["id"]]["rec"], _fir=ents[sc["id"]]["fir"], _early=ents[sc["id"]]["early"], _late=ents[sc["id"]]["late"]) for sc in scenes]}
+            "scenes": [dict(ents[sc["id"]]["rec"], _fir=ents[sc["id"]]["fir"][None], _fir_by_gender={g: f for g, f in ents[sc["id"]]["fir"].items() if g},
+                            _early=ents[sc["id"]]["early"], _late=ents[sc["id"]]["late"]) for sc in scenes]}
 
 
 def _donor_rule(scenes, stats, fits):

@@ -33,8 +33,8 @@ def part_cues(stems_dir, parts):
 
 
 def render_segment(stems_dir, segment, segment_ms, parts):
-    """parts: [{id, startMs, endMs, speaker, tempo, placeStartMs, take: WAV bytes}] (original slot, PSOLA tempo, placement of the
-    stretched take). Returns AAC-LC .m4a bytes, stereo 48 kHz, exactly the window [segment * segment_ms, +segment_ms) of the clip
+    """parts: [{id, startMs, endMs, speaker, tempo, placeStartMs, take: WAV bytes, gender?: "male"|"female"|None}] (original slot, PSOLA tempo, placement
+    of the stretched take, gender of the voice: its tone filter is measured against that gender's dry reference). Returns AAC-LC .m4a bytes, stereo 48 kHz, exactly the window [segment * segment_ms, +segment_ms) of the clip
     (the last window shorter). Parts whose reverb tail reaches into the window must be included (analyze() returns their reach as "mixTailMs"); raises
     NotPrepared when the clip was not analysed."""
     from .aac import encode_m4a

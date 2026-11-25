@@ -208,8 +208,8 @@ class Reference:
     dub yet when the clip is analysed, so every comparison uses this reference instead. The channel estimates depend on the dub only
     through its dry decay statistics, its long-term spectrum and the nominal regions of its speech."""
 
-    def __init__(self):
-        name = os.environ.get("STUDIO_MIX_REFERENCE", "dry_reference")  # alternative reference voices (tests / gender-specific tone)
+    def __init__(self, gender=None):
+        name = REFERENCE_ASSETS[gender]
         self.sig = load_audio(ASSETS / (name + ".flac"), 1, SR)[0]
         self.regions = [tuple(r) for r in json.load(open(ASSETS / (name + ".json")))["regions"]]
         self.duration_s = len(self.sig) / SR
@@ -226,10 +226,14 @@ class Reference:
         return self.sig[:i1], [(a, min(b, end)) for a, b in self.regions if a < end]
 
 
-_REFERENCE = []
+GENDERS = ("male", "female")
+REFERENCE_ASSETS = {None: "dry_reference", "male": "dry_reference_male", "female": "dry_reference_female"}
+_REFERENCE = {}
 
 
-def reference():
-    if not _REFERENCE:
-        _REFERENCE.append(Reference())
-    return _REFERENCE[0]
+def reference(gender=None):
+    """The dry reference voice: the mix of male and female voices (gender None, also for an unknown gender), or the male / female
+    voices alone (the tone of a speaker is measured against the reference of his own gender)."""
+    if gender not in _REFERENCE:
+        _REFERENCE[gender] = Reference(gender)
+    return _REFERENCE[gender]
