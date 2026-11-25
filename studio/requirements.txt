@@ -6,3 +6,6 @@ onnxruntime-gpu==1.23.2
 requests
 cryptography
 vastai==1.8.3
+nara_wpe
+numba
+threadpoolctl
