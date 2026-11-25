@@ -13,7 +13,7 @@ import multiprocessing as mp
 
 import numpy as np
 
-from . import levels, master, netflix, perspective, room_tone, take
+from . import levels, master, netflix, perspective, room_tone, take, taketone
 from .core import SR, Clip, frame_db, frame_power, read_range, runs
 
 ROLL_S = 2.0
@@ -91,8 +91,14 @@ def _nonverbal(speech2, parts, thr_db, n):
     return speech2 * (env * np.float32(NONVERBAL_GAIN))
 
 
-def render_pcm(stems_dir, segment, segment_ms, parts):
-    """The window as (2, n) float32 at SR (n = the window's length: segment_ms, shorter for the last window) and a timings dict."""
+CONTEXT_PRE = 40 * SR // 1000  # mastered samples before / after the window that the encoder gets as warm-up context (encode.PRE_MS / POST_MS)
+CONTEXT_POST = 20 * SR // 1000
+
+
+def render_pcm(stems_dir, segment, segment_ms, parts, context=False):
+    """The window as (2, n) float32 at SR (n = the window's length: segment_ms, shorter for the last window) and a timings dict.
+    context=True returns (pcm, pre, post, timings): pre / post = the mastered audio just before / after the window (same master
+    gain and limiter as the window; None at the start / end of the clip, shorter when less is available)."""
     t_start = time.perf_counter()
     docs = load_docs(stems_dir)
     meta, plan = docs["meta"], docs["plan"]
@@ -122,6 +128,13 @@ def render_pcm(stems_dir, segment, segment_ms, parts):
         lp.append({"o0": o0 - t0s, "o1": o1 - t0s, "d0": d0 - t0s, "d1": d1 - t0s, "err": d0 + len(x) / SR - p["endMs"] / 1000,
                    "pos": int(round((d0 - t0s) * SR)), "x": x, "speaker": p["speaker"], "gender": p.get("gender"), "o0_abs": o0, "o1_abs": o1})
     lp = [q for q in lp if q["pos"] + len(q["x"]) + int(reach * SR) > 0 and q["pos"] < n]
+
+    # --- tone of the voice from the takes heard so far (this window's own parts join the running per-scene estimate)
+    t = time.perf_counter()
+    own = [(0.5 * (q["o0_abs"] + q["o1_abs"]), q["x"], q["gender"]) for q in lp if 0 <= q["pos"] - roll < i1 - i0]
+    store = taketone._update_store(str(stems_dir), segment, taketone.contribution(docs["tone_src"], own))
+    plan = taketone.window_plan(plan, docs["tone_src"], store)
+    tim["tone"] = time.perf_counter() - t
 
     # --- the original of this window
     t = time.perf_counter()
@@ -173,7 +186,12 @@ def render_pcm(stems_dir, segment, segment_ms, parts):
     tim["mix"] = time.perf_counter() - t
 
     t = time.perf_counter()
-    out = master.finish(mixed, docs["master"], roll, roll)
+    c_pre = min(CONTEXT_PRE, i0) if context else 0
+    c_post = min(CONTEXT_POST, meta["n"] - i1) if context else 0
+    out = master.finish(mixed, docs["master"], roll - c_pre, roll - c_post)  # the middle part: context + window + context
     tim["master"] = time.perf_counter() - t
     tim["total"] = time.perf_counter() - t_start
-    return out[:, : i1 - i0], tim
+    pcm = out[:, c_pre:c_pre + i1 - i0]
+    if not context:
+        return pcm, tim
+    return pcm, (out[:, :c_pre] if c_pre else None), (out[:, c_pre + i1 - i0:] if c_post else None), tim

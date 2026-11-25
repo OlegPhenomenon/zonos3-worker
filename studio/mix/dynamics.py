@@ -55,7 +55,7 @@ from scipy.optimize import least_squares
 from . import core
 
 SR = core.SR
-FIT_BUDGET_S = 12.0  # compute budget of the fit (speech seconds used), not a signal property
+FIT_BUDGET_S = 40.0  # compute budget of the fit (speech seconds used), not a signal property
 PIECE = 500  # frames (ms) per fit piece; multiple of 50
 PRE = 1000  # frames of signal before each piece (detector warm-up)
 ALPHA = 0.01  # significance level of the held-out test

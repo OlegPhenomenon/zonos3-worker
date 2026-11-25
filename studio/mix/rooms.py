@@ -6,12 +6,12 @@ scene of the channel document:
 
 1. Voice statistics: free-decay curves after the phrase ends (5 ms octave-band envelopes, region ends refined to an "anchor", low
    quantile over events, stationary ambient removed), plus the anchor-free `nominal` version (time origin = the slot end).
-2. Two-component model per octave band fitted by analysis by synthesis against the dry reference voice `core.reference()`
-   (the product has no dub when the clip is analysed): simulate = reference voice * (delta + early + late), measure the same
-   statistics, move the parameters until they equal the stem's. The reference is used as a pack of REF_EVENTS isolated events
-   (the last REF_LEAD_S of a reference region + REF_PAUSE_S of digital silence, each convolved on its own): the reference's own pauses
-   are too short for the long-tau points, and the pack keeps one simulation at ~25 ms. late: diffuse noise (level at T_REF_L_S, slope); early: sparse
-   taps 5..100 ms = the late exponential continued back (prior) whose level is moved only when the data object strongly.
+2. Two-component model per octave band fitted by analysis by synthesis against a synthetic dub made from the dry reference voice
+   `core.reference()` (the product has no dub when the clip is analysed): the reference phrases are placed in the scene's speech regions
+   (see "the lab's dub side"), simulate = dub * (delta + early + late), measure the same statistics, move the parameters until they equal
+   the stem's. The lab measured stem and dub with a time -> frame drift (LAB_DRIFT) that both sides reproduce here. late: diffuse noise
+   (level at T_REF_L_S, slope); early: sparse taps 5..100 ms = the late exponential continued back (prior) whose level is moved only when
+   the data object strongly.
 3. M&E cross-check: decay events of the background stem (broadband level falls >= 12 dB within 50 ms after a 150 ms plateau); the
    low quartile of the per-band RT60 over events is the room estimate of the M&E.
 4. Decision per scene (voice / M&E agree within 2x -> voice, disagree -> blend, voice implausible -> me, nothing -> none = dry),
@@ -25,7 +25,10 @@ API
         {"sr", "floor_coherence" (per octave band or None), "scenes": [{"id","start","end", "early_params","late_params",
           "voice_rt60_s","voice_plausible","voice_reasons","voice_events","me_rt60_s","me_events","me_detail",
           "me_rt60_by_band_s","agreement","agreement_ratio","source","borrowed_from","rho_late","note","n_sims",
-          "early_late_energy_db","corr", "_fir" (taps,; tone against the mixed reference), "_fir_by_gender" {"male"|"female": (taps,)}, "_early" (2, m), "_late" (2, m)}]}
+          "early_late_energy_db","corr", "_fir" (taps,; tone against the mixed reference), "_fir_by_gender" {"male"|"female": (taps,)}, "_early" (2, m), "_late" (2, m),
+          "_p_stem" (cm.ltas bins, stem power spectrum of the scene), "_p_noise" (cm.noise_psd), "_room_gain" (|H_room|^2 = LTAS of the
+          gender-neutral reference through delta + early + late / LTAS of the reference, on the same bins; None for a scene without
+          a spectrum)}]}
         The lab's rooms.json schema; the wav files of the lab are the arrays `_fir`, `_early`, `_late` (WITHOUT the direct pulse;
         application per channel c: y_c = conv(x, fir * (delta + early[c] + late[c]))). A "none" scene has early / late = (2, 1)
         zeros. `chan` = the channel document (scenes with id, start, end, borrowed_from), `regions` = core.speech_regions(speech)
@@ -35,6 +38,7 @@ API
 """
 import math
 import multiprocessing as mp
+import threading
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -94,7 +98,7 @@ ME_GATE_S = 0.100
 # ----------------------------------------------------------------------------- speed settings
 TONE_GENDERS = (None,) + core.GENDERS  # tone filters: against the mixed reference (unknown gender), male and female voices
 TONE_REF_S = 45.0  # seconds of the dry reference voice the tone FIR is computed on (core.Reference.excerpt)
-SIM_NFFT_STEP = 12000  # simulation IR lengths are rounded up to this many samples so that FFT sizes (and cached spectra) repeat
+SIM_NFFT_STEP = 24000  # simulation IR lengths are rounded up to this many samples so that FFT sizes (and cached spectra) repeat
 
 _ENV = {}  # band-envelope tables
 _BANKS = {}  # Bank by rho
@@ -293,17 +297,6 @@ def nominal_curves(db, regions, floor):
     return ev, pre
 
 
-# ----------------------------------------------------------------------------- the dry reference voice (a simulation target)
-# The statistics compare the decay AFTER speech ends. The dry reference's natural pauses are short (0.3-0.5 s), so the long-tau points
-# (>= 0.6 s) would have < MIN_EVENTS events. The reference is therefore used as a pack of REF_EVENTS isolated events: the last
-# REF_LEAD_S of a reference region (speech) followed by REF_PAUSE_S of digital silence (exactly what a pause of the dry reference is),
-# every event simulated on its own (a ring-out beyond the pause never reaches the next event's statistic window).
-
-REF_EVENTS = 12
-REF_LEAD_S = 1.5
-REF_PAUSE_S = 2.9  # > ANCHOR_SEARCH_S + TAU_S[-1] + 0.05
-
-
 def _event_frames(Y, rows, cols, workers=1):
     """Band power (dB) of the envelope frames `cols` (same shape as rows, frame indices) of the events Y (N, L): (*cols.shape, NB)."""
     w, win, hop = _env_tables()
@@ -315,10 +308,10 @@ def _event_frames(Y, rows, cols, workers=1):
     return out.reshape(*cols.shape, NB).astype(np.float64)
 
 
-def sim_events(Y, end_s):
+def sim_events(Y, end_s, nxt_rel):
     """(anchored curves, nominal curves), both (events, taus, bands), of the simulated events Y (N, L): the same statistic as
-    channel_match.decay_curves / nominal_curves at the fixed noise floor SIM_FLOOR_DB, for events that end at end_s (all alike) and
-    are followed by silence longer than the longest tau."""
+    channel_match.decay_curves / nominal_curves at the fixed noise floor SIM_FLOOR_DB, for events whose nominal end is at end_s
+    (all alike) and whose next region starts at nxt_rel (N,) seconds (inf = none): taus beyond it are not measured."""
     hop = cm.ENV_HOP_S
     off = cm.ENV_WIN / 2 / SR
     npre = int(cm.PRE_WIN_S / hop)
@@ -344,46 +337,114 @@ def sim_events(Y, end_s):
     db2 = _event_frames(Y, np.repeat(np.arange(n)[:, None], c2.shape[1], 1), c2)
     nt = len(TAU)
     okb, okn = p > SIM_FLOOR_DB + 15.0, p_nom > SIM_FLOOR_DB + 15.0
-    ev = np.where(okb[:, None, :], db2[:, :nt] - p[:, None, :], np.nan)
-    nev = np.where(okn[:, None, :], db2[:, nt:] - p_nom[:, None, :], np.nan)
+    t_anchor = ia * hop + off
+    tau_a = np.cumprod(t_anchor[:, None] + TAU[None, :] + 0.05 <= nxt_rel[:, None], axis=1).astype(bool)  # the lab loop breaks at the first tau that does not fit
+    tau_n = np.cumprod(end_s + TAU[None, :] + 0.05 <= nxt_rel[:, None], axis=1).astype(bool)
+    ev = np.where(okb[:, None, :] & tau_a[:, :, None], db2[:, :nt] - p[:, None, :], np.nan)
+    nev = np.where(okn[:, None, :] & tau_n[:, :, None], db2[:, nt:] - p_nom[:, None, :], np.nan)
     ev[~has] = np.nan
     return ev, nev
 
 
-def reference_sim():
-    """The reference event pack every fit simulates: dict(x (N, S) float32 speech ends, end_s, dry = (stat, se) of the unprocessed
-    pack, spec = cache of the events' spectra by FFT size)."""
-    if "x" not in _REF:
-        ref = core.reference()
-        s_n = int(REF_LEAD_S * SR)
-        cand = [(a, b) for a, b in ref.regions if b - a >= REF_LEAD_S + 0.05]
-        pick = np.unique(np.linspace(0, len(cand) - 1, REF_EVENTS).round().astype(int))
-        fade = np.minimum(np.arange(s_n) / (0.01 * SR), 1.0).astype(np.float32)
-        x = np.stack([ref.sig[int(round(cand[k][1] * SR)) - s_n: int(round(cand[k][1] * SR))] * fade for k in pick]).astype(np.float32)
-        _REF.update(x=x, end_s=REF_LEAD_S, n_total=s_n + int(REF_PAUSE_S * SR), spec={})
-        ev0, _ = sim_events(_pad_events(x), REF_LEAD_S)
-        _REF["dry"] = (cm.decay_stat(ev0)[0], cm.decay_stat_se(ev0))
-    return _REF
+# ----------------------------------------------------------------------------- the lab's dub side
+# The lab measured every decay statistic with a time -> frame drift: ENV_HOP_S = 0.005 s was used as the distance of the envelope
+# frames, but at 44.1 kHz they were 220 samples = 4.9887 ms apart, so a region time t was looked up at t * LAB_DRIFT of the signal, on the
+# stem AND on the dub track. The dub track was the dry TTS of the parts placed in the slots over the whole scene. To reproduce the lab's
+# rooms both sides are reproduced: the stem regions are scaled by LAB_DRIFT, and a synthetic dub (the dry reference voice placed in
+# the scene's speech regions, ending at the region ends, silence elsewhere) is measured at the same scaled region times.
+
+LAB_DRIFT = 220 / 44100 / 0.005
+DUB_EVENTS = 32  # dub events (regions of the scene, evenly spread) per scene: each is simulated as its own segment
+DUB_LEAD_S = 2.5  # dub history before an event's looked-up end (the longest IR the simulation can observe)
+DUB_POST_S = 2.9  # after it: > ANCHOR_SEARCH_S + TAU_S[-1] + 0.05
+PHRASE_GAP_S = 0.15  # between the reference phrases that fill a region longer than any of them
+_SPEC_CACHE_MAX = 3
 
 
-def _pad_events(x, n_total=None):
-    n_total = n_total or _REF["n_total"]
-    out = np.zeros((len(x), n_total), np.float32)
-    k = min(x.shape[1], n_total)
-    out[:, :k] = x[:, :k]
+def lab_regions(regions):
+    """Scene-relative regions (s) as the lab's drifted time lookup saw them."""
+    return [(a * LAB_DRIFT, b * LAB_DRIFT) for a, b in regions]
+
+
+def place_reference(regions):
+    """The synthetic lab-like dub of a scene: pieces (scene-relative start samples, float32 arrays), sorted by start. Every region
+    (a, b) s gets reference phrases (core.reference(), whole phrases of about the remaining length, cycling through the reference) so
+    that the speech ends exactly at b and starts at a (the first phrase is cut when it is longer); silence elsewhere."""
+    ref = core.reference()
+    rr = [(int(a * SR), int(b * SR)) for a, b in ref.regions]
+    lens = np.array([b - a for a, b in rr])
+    order = np.argsort(-lens)
+    cursor = 0
+    pieces = []
+    gap = int(PHRASE_GAP_S * SR)
+    for a, b in regions:
+        end, remaining = int(round(b * SR)), int(round((b - a) * SR))
+        while remaining > 0:
+            ok = order[lens[order] <= remaining]
+            if len(ok):
+                k = int(ok[cursor % min(len(ok), 8)])
+            else:
+                k = int(order[-1 - cursor % 8])
+            cursor += 1
+            ph = ref.sig[rr[k][0]:rr[k][1]]
+            if len(ph) > remaining:
+                ph = ph[len(ph) - remaining:].copy()
+                ph[:int(0.01 * SR)] *= np.linspace(0, 1, int(0.01 * SR), dtype=np.float32)
+            pieces.append((end - len(ph), ph))
+            end -= len(ph) + gap
+            remaining -= len(ph) + gap
+    pieces.sort(key=lambda q: q[0])
+    return pieces
+
+
+def _segment(pieces, starts, s0, n):
+    """Samples [s0, s0 + n) of the placed dub (zeros where nothing is placed; s0 may be negative)."""
+    out = np.zeros(n, np.float32)
+    j = max(int(np.searchsorted(starts, s0)) - 12, 0)  # pieces are at most ~7 s long: 12 earlier ones cover any overlap
+    while j < len(pieces) and pieces[j][0] < s0 + n:
+        st, ph = pieces[j]
+        a, b = max(st, s0), min(st + len(ph), s0 + n)
+        if b > a:
+            out[a - s0:b - s0] += ph[a - st:b - st]
+        j += 1
     return out
 
 
-def ref_through(ref, h):
-    """The reference events (N, n_total) convolved with the mono IR h (each event on its own, the ring-out beyond the pause is cut)."""
-    x = ref["x"]
-    s_n = x.shape[1]
-    m = -(-len(h) // SIM_NFFT_STEP) * SIM_NFFT_STEP
-    nfft = sfft.next_fast_len(s_n + m - 1, real=True)
-    if nfft not in ref["spec"]:
-        ref["spec"][nfft] = sfft.rfft(x, nfft, axis=1)
-    y = sfft.irfft(ref["spec"][nfft] * sfft.rfft(h, nfft)[None, :], nfft, axis=1)
-    return _pad_events(y.astype(np.float32))
+def lab_dub(regions):
+    """The dub side of a scene's fit: dict(x (N, L) float32 event segments of the synthetic dub, end_s = DUB_LEAD_S (the looked-up
+    nominal end inside every segment), nxt (N,) the next region's looked-up start in segment seconds, dry = (stat, se) of the dub
+    itself, spec = FFT cache). regions = the scene's stem regions, scene-relative seconds (unscaled)."""
+    pieces = place_reference(regions)
+    starts = np.array([q[0] for q in pieces])
+    drifted = lab_regions(regions)
+    cand = [k for k in range(len(regions)) if drifted[k][1] >= 0.6]
+    pick = np.unique(np.linspace(0, len(cand) - 1, min(DUB_EVENTS, len(cand))).round().astype(int))
+    n = int((DUB_LEAD_S + DUB_POST_S) * SR)
+    x, nxt = [], []
+    for k in (cand[i] for i in pick):
+        s0 = int(round((drifted[k][1] - DUB_LEAD_S) * SR))
+        x.append(_segment(pieces, starts, s0, n))
+        nxt.append(drifted[k + 1][0] - drifted[k][1] + DUB_LEAD_S if k + 1 < len(regions) else np.inf)
+    rs = {"x": np.stack(x), "end_s": DUB_LEAD_S, "nxt": np.array(nxt), "spec": {}, "lock": threading.Lock()}
+    ev0, _ = sim_events(rs["x"], rs["end_s"], rs["nxt"])
+    rs["dry"] = (cm.decay_stat(ev0)[0], cm.decay_stat_se(ev0))
+    return rs
+
+
+def ref_through(rs, h):
+    """The dub events (N, L) convolved with the mono IR h (each event on its own, cut to its length)."""
+    x = rs["x"]
+    n = x.shape[1]
+    m = -(-min(len(h), n) // SIM_NFFT_STEP) * SIM_NFFT_STEP
+    nfft = sfft.next_fast_len(n + m - 1, real=True)
+    with rs["lock"]:
+        if nfft not in rs["spec"]:
+            if len(rs["spec"]) >= _SPEC_CACHE_MAX:
+                rs["spec"].pop(next(iter(rs["spec"])))
+            rs["spec"][nfft] = sfft.rfft(x, nfft, axis=1)
+        spec = rs["spec"][nfft]
+    y = sfft.irfft(spec * sfft.rfft(h[:n], nfft)[None, :], nfft, axis=1)[:, :n]
+    return y.astype(np.float32)
 
 
 # ----------------------------------------------------------------------------- voice statistics and fit
@@ -432,7 +493,7 @@ def fit_layers(ref, rs, bank, late_fixed=None, early_on=True, threads=1, start=N
 
     def simulate(early, late):
         n_sims[0] += 1
-        ev, nevc = sim_events(ref_through(rs, mono_ir(bank, early, late, cap_s=rs["n_total"] / SR)), rs["end_s"])
+        ev, nevc = sim_events(ref_through(rs, mono_ir(bank, early, late, cap_s=rs["x"].shape[1] / SR)), rs["end_s"], rs["nxt"])
         sim = np.maximum(cm.decay_stat(ev)[0], floor_rel[None, :])  # below the stem's ambient nothing can be observed
         sim_n = None
         if nom is not None:
@@ -852,7 +913,7 @@ def scene_record(sc, res, bank, threads=1):
             src, d["source"], d["agreement"] = "none", "none", "no evidence"
             late_p = none_p
         else:
-            f2 = fit_layers(ref, res["rs"], bank, late_fixed=d["late_slopes"], early_on=False, threads=threads)
+            f2 = fit_layers(ref, res["rs"](), bank, late_fixed=d["late_slopes"], early_on=False, threads=threads)
             n_sims += f2["n_sims"]
             info_l = f2["info_late"]
             ok2 = [plausible_late(i)[0] for i in info_l]  # same garbage rule on the refit
@@ -923,13 +984,14 @@ def _stats_job(i):
     me_res = me_events(g["me_env"], t0, t1)
     out = {"few": False, "me": me_summary(me_res), "me_res": me_res}
     sreg = [(a - tb, b - tb) for a, b in cm.window_regions(g["regions"], t0, t1)]
+    out["sreg"] = sreg
     if len(sreg) < 2:
         out["few"] = True
         return out
     i0, i1 = int(t0 * SR), min(int(t1 * SR), g["n"])
     sseg = g["stem"][i0:i1]
     with threadpool_limits(1), ThreadPoolExecutor(3) as ex:  # the three are independent and mostly FFT / sorting (GIL released)
-        f_vs = ex.submit(voice_stats, g["stem_db"][f0:f1], sreg)
+        f_vs = ex.submit(voice_stats, g["stem_db"][f0:f1], lab_regions(sreg))
         f_ltas = ex.submit(cm.ltas, sseg, [(a - t0, b - t0) for a, b in cm.window_regions(g["regions"], t0, t1)], SR)
         f_noise = ex.submit(cm.noise_psd, sseg, SR)
         out["vs"], out["p_stem"], out["p_noise"] = f_vs.result(), f_ltas.result()[0], f_noise.result()
@@ -949,9 +1011,16 @@ def _fit_job(args):
     """Worker, phase 2: fit, decision and rendering of a scene from its phase 1 evidence. Returns (record, early, late)."""
     i, st, threads = args
     g = _G
-    res = {"me": st["me"], "me_res": st["me_res"], "rs": g["rs"], "vs": st["vs"]}
+    memo = []
+
+    def dub():  # the scene's synthetic dub, built on first use
+        if not memo:
+            memo.append(lab_dub(st["sreg"]))
+        return memo[0]
+
+    res = {"me": st["me"], "me_res": st["me_res"], "rs": dub, "vs": st["vs"]}
     with threadpool_limits(1):
-        res["fit"] = None if not cm.enough_events(st["vs"]["cnt"]) else fit_layers(st["vs"], g["rs"], g["bank"], threads=threads, start=_start_levels(g["scenes"][i]))
+        res["fit"] = None if not cm.enough_events(st["vs"]["cnt"]) else fit_layers(st["vs"], dub(), g["bank"], threads=threads)
         return scene_record(g["scenes"][i], res, g["bank"], threads)
 
 
@@ -966,7 +1035,7 @@ def analyze(clip, chan, regions, workers=8, tone=None):
     rho = floor_rho(tone)
     scenes = chan["scenes"]
     stem = clip.speech
-    _G.update(scenes=scenes, n=clip.n, stem=stem, regions=regions, bank=get_bank(rho), rs=reference_sim(),
+    _G.update(scenes=scenes, n=clip.n, stem=stem, regions=regions, bank=get_bank(rho),
               stem_db=env_db_parallel(stem, workers), me_env=me_env(clip.bg2.mean(0), workers))
     for g in TONE_GENDERS:  # loads the reference excerpts before the fork
         dub_ltas(np.zeros((2, 1), np.float32), np.zeros((2, 1), np.float32), g)
@@ -987,6 +1056,9 @@ def analyze(clip, chan, regions, workers=8, tone=None):
     _G.clear()
     ident = np.zeros(EQ_TAPS, np.float32)
     ident[0] = 1.0
+    dry = dub_ltas(np.zeros((2, 1), np.float32), np.zeros((2, 1), np.float32), None)
+    for e in ents.values():
+        e["room_gain"] = None if e["few"] else p_dub[(e["room"], None)] / np.maximum(dry, 1e-30)
     for e in ents.values():
         e["fir"] = {g: ident if e["few"] else tone_fir(e["p_stem"], e["p_noise"], p_dub[(e["room"], g)]) for g in TONE_GENDERS}
     for sc in scenes:  # a scene with fewer than 2 speech regions that borrowed a room takes the donor's tone filter too
@@ -995,7 +1067,8 @@ def analyze(clip, chan, regions, workers=8, tone=None):
             e["fir"] = ents[e["rec"]["borrowed_from"]]["fir"]
     return {"sr": SR, "floor_coherence": None if rho is None else [float(v) for v in rho],
             "scenes": [dict(ents[sc["id"]]["rec"], _fir=ents[sc["id"]]["fir"][None], _fir_by_gender={g: f for g, f in ents[sc["id"]]["fir"].items() if g},
-                            _early=ents[sc["id"]]["early"], _late=ents[sc["id"]]["late"]) for sc in scenes]}
+                            _early=ents[sc["id"]]["early"], _late=ents[sc["id"]]["late"], _p_stem=ents[sc["id"]].get("p_stem"),
+                            _p_noise=ents[sc["id"]].get("p_noise"), _room_gain=ents[sc["id"]].get("room_gain")) for sc in scenes]}
 
 
 def _donor_rule(scenes, stats, fits):

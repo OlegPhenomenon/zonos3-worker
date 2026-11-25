@@ -80,11 +80,11 @@ ANCHOR_SEARCH_S = 0.25  # the nominal end of a region is refined within +-this
 ANCHOR_DROP_DB = 15.0
 LTAS_N = 4096
 REF_FIT_S = 45.0  # seconds of the reference voice used per scene (whole regions)
-DYN_BODY_S = 8.0  # dynamics fit: stretches of the scene that are dereverberated (WPE) and fitted ...
-DYN_LEAD_S = 1.0  # ... each with this much signal before it for the WPE prediction
+DYN_BODY_S = 10.0  # dynamics fit: stretches of the scene that are dereverberated (WPE) and fitted ...
+DYN_LEAD_S = 2.0  # ... each with this much signal before it for the WPE prediction
 WPE_RATE = 16000  # WPE runs on a 16 kHz copy (32 ms window, 16 ms hop); its gain mask is applied to the full-band signal
 WPE_NFFT, WPE_HOP = 512, 256
-WPE_TAIL_S, WPE_ITERS, WPE_DELAY = 0.5, 2, 2
+WPE_TAIL_S, WPE_ITERS, WPE_DELAY = 1.0, 3, 2
 
 pow2 = core.pow2
 

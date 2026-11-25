@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from . import channel, defects, locations, master, netflix, perspective, room_tone, rooms, scenes, spans
+from . import channel, defects, locations, master, netflix, perspective, room_tone, rooms, scenes, spans, taketone
 from .core import SR, Clip, speech_regions
 
 WORKERS = 8
@@ -53,6 +53,7 @@ def analyze(stems_dir, workers=WORKERS):
         lap("defects_persp_master")
     locs = locations.cluster(scene_doc, chan)
     plan = netflix.build_plan(chan, rooms_doc, defects_doc, locs)
+    tone_src = taketone.prepare(clip, chan, rooms_doc, defects_doc, locs, regions)
     lap("plan")
     voice = np.zeros(clip.n, bool)
     for a, b in regions:
@@ -60,7 +61,7 @@ def analyze(stems_dir, workers=WORKERS):
     peak = float(np.abs(clip.speech2[:, voice]).max()) if voice.any() else 1.0
     meta = {"n": clip.n, "duration_s": clip.duration_s, "activity_thr_db": thr, "spans": spans.spans_of(mask),
             "voice_peak_db": float(20 * np.log10(peak + 1e-12))}
-    clip.save_doc("render", {"meta": meta, "plan": plan, "tone": tone, "persp": persp, "master": mast})
+    clip.save_doc("render", {"meta": meta, "plan": plan, "tone_src": tone_src, "tone": tone, "persp": persp, "master": mast})
     lap("save")
     tim["total"] = round(sum(tim.values()), 3)
     tim["mixTailMs"] = int(np.ceil(plan["tail_s"] * 1000))

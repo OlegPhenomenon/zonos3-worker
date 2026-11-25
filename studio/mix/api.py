@@ -3,9 +3,8 @@
 `stems_dir` layout (written by the worker after separation): `mix.flac` (original, stereo 48 kHz), `speech.flac`, `bg.flac`
 (dialogue / music+effects stems, same length and rate). `analyze` adds `analysis/`.
 """
-from pathlib import Path
-
 from . import analysis, cues, render, spans
+from .encode import encode_opus
 from .render import NotPrepared, load_docs
 
 __all__ = ["NotPrepared", "speech_spans", "analyze", "part_cues", "render_segment"]
@@ -34,9 +33,8 @@ def part_cues(stems_dir, parts):
 
 def render_segment(stems_dir, segment, segment_ms, parts):
     """parts: [{id, startMs, endMs, speaker, tempo, placeStartMs, take: WAV bytes, gender?: "male"|"female"|None}] (original slot, PSOLA tempo, placement
-    of the stretched take, gender of the voice: its tone filter is measured against that gender's dry reference). Returns AAC-LC .m4a bytes, stereo 48 kHz, exactly the window [segment * segment_ms, +segment_ms) of the clip
+    of the stretched take, gender of the voice: its tone filter is measured against that gender's dry reference). Returns Ogg Opus bytes (audio/ogg, encode.py), stereo 48 kHz, decoding to exactly the window [segment * segment_ms, +segment_ms) of the clip
     (the last window shorter). Parts whose reverb tail reaches into the window must be included (analyze() returns their reach as "mixTailMs"); raises
     NotPrepared when the clip was not analysed."""
-    from .aac import encode_m4a
-    pcm, _ = render.render_pcm(stems_dir, segment, segment_ms, parts)
-    return encode_m4a(pcm, Path(stems_dir))
+    pcm, pre, post, _ = render.render_pcm(stems_dir, segment, segment_ms, parts, context=True)
+    return encode_opus(pcm, pre, post)

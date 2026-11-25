@@ -99,7 +99,7 @@ def layer_sum(a, b):
     return out
 
 
-def _location_tone(firs, w, thin, trt):
+def _location_tone(firs, w, thin, trt, max_boost_db=None):
     """The location's tone filter from its member scenes' filters: speech-weighted mean in dB (flat for a thin location), defect edges
     relaxed, boost capped, minimum phase. Returns (fir, rms spread of the members in dB)."""
     mags = np.stack([fir_db(f) for f in firs])
@@ -109,7 +109,7 @@ def _location_tone(firs, w, thin, trt):
     spread = float(np.sqrt(((mags - mag) ** 2 * w[:, None]).sum() / (w.sum() * mags.shape[1])))
     mag = relax_edges(mag, trt.get("relax_hp_hz"), trt.get("relax_lp_hz"))
     band = np.fft.rfftfreq(NFFT, 1 / SR)
-    mag = np.minimum(mag, np.median(mag[(band >= TONE_REF_HZ[0]) & (band <= TONE_REF_HZ[1])]) + MAX_TONE_BOOST_DB)
+    mag = np.minimum(mag, np.median(mag[(band >= TONE_REF_HZ[0]) & (band <= TONE_REF_HZ[1])]) + (MAX_TONE_BOOST_DB if max_boost_db is None else max_boost_db))
     return minphase(mag), spread
 
 
