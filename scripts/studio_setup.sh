@@ -5,8 +5,8 @@
 #
 #   VAST_API_KEY=… scripts/studio_setup.sh <image tag>      e.g. studio-<sha>
 #
-# Pool: stopped workers with the image already pulled are kept as the cache (cold_workers=4, storage-only billing: a stopped worker
-# whose host was rented out meanwhile does not come back, and a fresh one takes minutes), up to 4 active.
+# Pool: stopped workers with the image already pulled are kept as the cache (cold_workers=3, storage-only billing: a stopped worker
+# whose host was rented out meanwhile does not come back, and a fresh one takes minutes), up to 3 active.
 # The worker holds up to STUDIO_CACHE_GB (40) of stems per audio file on its disk, so the disk is 80 GB.
 set -euo pipefail
 
@@ -15,12 +15,13 @@ IMAGE=ghcr.io/olegphenomenon/zonos3-worker
 ENDPOINT_NAME="${VAST_ENDPOINT:-studio-prep}"
 VAST_URL=https://console.vast.ai/api/v0
 DISK_GB=80
-MAX_DPH="${VAST_MAX_DPH:-0.15}"
+MAX_DPH="${VAST_MAX_DPH:-0.13}"
 # Ampere only: on an RTX 4070 (Ada, sm_89, driver 580) the fp16 separator returned NaN on CUDA (the worker now refuses to start then).
 # At least 12 CPU cores: the worker also mixes the pieces (the lab's dub_mix.py, up to 3 at once, WPE on 6 processes each); on a
 # 6-core instance a piece's channel estimate took 46 s instead of ~12 s.
-SEARCH_PARAMS="gpu_name in [RTX_3060,RTX_3060_Ti,RTX_3070,RTX_3070_Ti,RTX_3080,RTX_3080_Ti,RTX_A4000,RTX_A4500,RTX_A5000,\
-RTX_3090] dph_total<=$MAX_DPH compute_cap>=860 compute_cap<870 cpu_cores_effective>=12 \
+# Mid-range cards only: the separator and the emotion model are small, a bigger card only costs more.
+SEARCH_PARAMS="gpu_name in [RTX_3060,RTX_3060_Ti,RTX_3070,RTX_3070_Ti,RTX_A4000] dph_total<=$MAX_DPH \
+compute_cap>=860 compute_cap<870 cpu_cores_effective>=12 \
 gpu_ram>=8 cpu_ram>=16 inet_down>=500 reliability>=0.98 cuda_max_good>=12.4 num_gpus=1 disk_space>=$DISK_GB verified=true rentable=true rented=false"
 LAUNCH_ARGS="--image $IMAGE:$TAG --env '-p 3000:3000' --disk $DISK_GB --onstart-cmd 'cd /app && exec python3 -u -m studio.vast_worker'"
 
@@ -47,7 +48,7 @@ send() { api "$1" "$2" -H 'Content-Type: application/json' --data-binary @-; }
 
 endpoint_body() {
   jq -n --arg name "$ENDPOINT_NAME" '{
-    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 4, max_workers: 4,
+    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 3, max_workers: 3,
     target_util: 0.7, inactivity_timeout: 300, autoscaler_instance: "prod"
   }'
 }
