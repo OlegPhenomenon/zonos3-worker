@@ -9,8 +9,9 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
   /prepare   {audioUrl, audioHash, haveHead?}
                                     -> {"pending": true} while the file is being separated in the background (ask again); once the
                                        head (the first HEAD_S of a longer file) is separated, the pending answer also carries
-                                       {durationMs, headS, speechHead} (not when the caller says haveHead), then
-                                       {audioHash, durationMs, speechStem, timings, cached}
+                                       {durationMs, headS, speechHead, backgroundHead} (not when the caller says haveHead), then
+                                       {audioHash, durationMs, speechStem, backgroundStem, timings, cached}; the background
+                                       (mix - speech, stereo ogg/opus 96 kbit/s) is what the per-cue path plays under its lines
   /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
   /mix_plan  {audioHash, rows: [{start, end, speaker}], voices: {speaker: voice}, samples: {voice: flac}}
                                     -> {"pending": true} | {"ready": true}: the draft's mix analyses (the lab's mix_plan.py build:
@@ -23,16 +24,20 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
                                        still being separated, for a piece inside the head), mixed by mix_clip.py netflix on the
                                        plan's analyses (cut to the piece: mix_plan.py slice; a plan still being measured is
                                        waited for up to PLAN_WAIT_S), else on the piece's own
+  /mix_cue   {audioHash, startS, endS, dub: audio}
+                                    -> {mix: flac (stereo 44.1 kHz, the take's length), timings}: one dub line of the per-cue path
+                                       mixed against the original voice of its slot (the lab's mix_cue.py: level, tone, balance;
+                                       no room), tens of milliseconds
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
 download_failed, prepare_failed, ser_failed, mix_failed.
 
-Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json, plan/}, least recently used evicted
+Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, bg.opus, prepare.json, plan/}, least recently used evicted
 above STUDIO_CACHE_GB (default 40). The directory appears atomically (renamed from <hash>.tmp) only after a complete prepare.
 CACHE_DIR/<audioHash>.head/ holds the same files for the first HEAD_S + HEAD_PAD_S of a long file, separated first: the separator
 works in 8 s chunks with no state across them, so up to HEAD_S + HEAD_PAD_S - 8 s the head's stems are the whole file's.
 """
-import asyncio, base64, contextlib, ipaddress, json, logging, math, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid
+import asyncio, base64, contextlib, io, ipaddress, json, logging, math, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -98,6 +103,7 @@ class EarliestFirst:
 _mix_slots = EarliestFirst(int(os.environ.get('STUDIO_MIXES', '2')))
 UNITS_PER_WORKER_S = 17.0  # /prepare benchmark: ~17 seconds of video separated per second of worker time
 SER_S_PER_CLIP = 0.3
+MIX_CUE_S = 0.1  # a line's mix (mix_cue.py): tens of milliseconds
 _active: dict[str, int] = {}  # audioHash -> requests using its directory right now (never evicted)
 _cache_lock = threading.Lock()
 
@@ -264,6 +270,17 @@ def encode_stem(speech_flac: Path, dst: Path) -> None:
          str(dst)], 'prepare_failed', 600)
 
 
+def background(d: Path) -> str:
+    """The background stem (mix - speech) for the per-cue path, where the phone plays it under the dub lines: stereo ogg/opus
+    96 kbit/s, base64; encoded once per stems dir."""
+    dst = d / 'bg.opus'
+    if not dst.exists():
+        run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(d / 'bg.flac'), '-ac', '2', '-c:a', 'libopus', '-b:a', '96k',
+             '-vbr', 'on', str(d / 'bg.tmp.opus')], 'prepare_failed', 600)
+        (d / 'bg.tmp.opus').rename(dst)
+    return base64.b64encode(dst.read_bytes()).decode()
+
+
 def prepare_blocking(url: str, audio_hash: str) -> dict:
     final = stems_dir(audio_hash)
     tmp = CACHE_DIR / f'{audio_hash}.tmp'
@@ -296,6 +313,7 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
                 s = time.time()
                 sep.separate_file(head / 'mix.flac', head, _sep)
             encode_stem(head / 'speech.flac', head / 'speech.opus')
+            background(head)
             (head / 'head.json').write_text(json.dumps({'durationMs': dur, 'headS': HEAD_S}))
             t['head_s'] = round(time.time() - t0, 2)
         s = time.time()
@@ -306,6 +324,7 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
         t['separate_s'] = round(time.time() - s, 2)
         s = time.time()
         encode_stem(tmp / 'speech.flac', tmp / 'speech.opus')
+        background(tmp)
         t['encode_s'] = round(time.time() - s, 2)
         t['total_s'] = round(time.time() - t0, 2)
         (tmp / 'prepare.json').write_text(json.dumps({'durationMs': dur, 'timings': t}))
@@ -324,7 +343,8 @@ def prepare_blocking(url: str, audio_hash: str) -> dict:
 def answer_prepared(d: Path, cached: bool) -> dict:
     meta = json.loads((d / 'prepare.json').read_text())
     return {'audioHash': d.name, 'durationMs': meta['durationMs'],
-            'speechStem': base64.b64encode((d / 'speech.opus').read_bytes()).decode(), 'timings': meta['timings'], 'cached': cached}
+            'speechStem': base64.b64encode((d / 'speech.opus').read_bytes()).decode(), 'backgroundStem': background(d),
+            'timings': meta['timings'], 'cached': cached}
 
 
 def prepare_in_use(url: str, audio_hash: str) -> dict:
@@ -354,7 +374,7 @@ async def prepare(**p) -> dict:
             if not p.get('haveHead') and (hd / 'head.json').exists():
                 meta = json.loads((hd / 'head.json').read_text())
                 return {'audioHash': h, 'pending': True, 'durationMs': meta['durationMs'], 'headS': meta['headS'],
-                        'speechHead': base64.b64encode((hd / 'speech.opus').read_bytes()).decode()}
+                        'speechHead': base64.b64encode((hd / 'speech.opus').read_bytes()).decode(), 'backgroundHead': background(hd)}
             return {'audioHash': h, 'pending': True}
         _prepare_jobs.pop(h, None)
         return job.result()
@@ -565,6 +585,54 @@ async def mix_piece(**p) -> dict:
         return answer_error(e)
 
 
+# ---------------------------------------------------------------- /mix_cue
+def mix_cue_blocking(p: dict) -> dict:
+    """One dub line mixed against the original line in its slot (the lab's mix_cue.py: level, tone, balance; no room)."""
+    import numpy as np
+    import soundfile as sf
+    from scipy.signal import resample_poly
+    try:
+        start_s, end_s = float(p['startS']), float(p['endS'])
+    except (KeyError, TypeError, ValueError) as e:
+        raise Fail('bad_request', repr(e))
+    if start_s < 0 or not 0 < end_s - start_s <= 60:
+        raise Fail('bad_request', 'need 0 <= startS < endS <= startS + 60')
+    import mix_cue as lab_mix
+    t0 = time.time()
+    try:
+        dub, rate = sf.read(io.BytesIO(decode_b64(p.get('dub', ''), 'dub')), dtype='float32', always_2d=True)
+    except Fail:
+        raise
+    except Exception as e:
+        raise Fail('bad_request', f'dub: {e!r}')
+    dub = dub.mean(1)
+    if rate != lab_mix.SR:
+        dub = resample_poly(dub, lab_mix.SR, rate).astype(np.float32)
+    take_s = len(dub) / lab_mix.SR
+    half = max(take_s, end_s - start_s, lab_mix.CONTEXT_S) / 2 + 1
+    mid = start_s + (end_s - start_s) / 2
+    d = stems_for(p, max(end_s, start_s + take_s))  # the context is cut to what the stems hold
+    with using(d.name):
+        info = sf.info(str(d / 'speech.flac'))
+        a = max(0, int((mid - half) * info.samplerate))
+        b = min(info.frames, int((mid + half) * info.samplerate))
+        stem, _ = sf.read(str(d / 'speech.flac'), start=a, stop=b, dtype='float32', always_2d=True)
+    stem = resample_poly(stem.T, 147, 160, axis=1).astype(np.float32) if info.samplerate == 48000 else stem.T
+    offset = a / info.samplerate
+    slot, context = lab_mix.window(stem, start_s - offset, max(end_s, start_s + take_s) - offset)
+    out = lab_mix.mix_cue(slot, context, dub)
+    buf = io.BytesIO()
+    sf.write(buf, out.T, lab_mix.SR, format='FLAC', subtype='PCM_16')
+    return {'mix': base64.b64encode(buf.getvalue()).decode(), 'timings': {'total_s': round(time.time() - t0, 3)}}
+
+
+async def mix_cue(**p) -> dict:
+    try:
+        return await asyncio.get_running_loop().run_in_executor(_cpu, mix_cue_blocking, p)
+    except Fail as e:
+        return answer_error(e)
+
+
 # ---------------------------------------------------------------- lifecycle
 def load_separator():
     global _sep
@@ -627,7 +695,8 @@ def main():
                       workload_calculator=lambda p: UNITS_PER_WORKER_S * SER_S_PER_CLIP * max(1, len(p.get('clips') or {})), **common),
         HandlerConfig(route='/mix_plan', remote_function=mix_plan, workload_calculator=lambda p: UNITS_PER_WORKER_S, **common),
         HandlerConfig(route='/mix_piece', remote_function=mix_piece,
-                      workload_calculator=lambda p: UNITS_PER_WORKER_S * float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common)])).run()
+                      workload_calculator=lambda p: UNITS_PER_WORKER_S * float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common),
+        HandlerConfig(route='/mix_cue', remote_function=mix_cue, workload_calculator=lambda p: UNITS_PER_WORKER_S * MIX_CUE_S, **common)])).run()
 
 
 if __name__ == '__main__':
