@@ -5,7 +5,8 @@
 #
 #   VAST_API_KEY=… scripts/studio_setup.sh <image tag>      e.g. studio-<sha>
 #
-# Pool: stopped workers with the image already pulled are kept as the cache (cold_workers=2, storage-only billing), up to 4 active.
+# Pool: stopped workers with the image already pulled are kept as the cache (cold_workers=4, storage-only billing: a stopped worker
+# whose host was rented out meanwhile does not come back, and a fresh one takes minutes), up to 4 active.
 # The worker holds up to STUDIO_CACHE_GB (40) of stems per audio file on its disk, so the disk is 80 GB.
 set -euo pipefail
 
@@ -46,7 +47,7 @@ send() { api "$1" "$2" -H 'Content-Type: application/json' --data-binary @-; }
 
 endpoint_body() {
   jq -n --arg name "$ENDPOINT_NAME" '{
-    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 2, max_workers: 4,
+    client_id: "me", endpoint_name: $name, min_load: 0, min_cold_load: 0, cold_workers: 4, max_workers: 4,
     target_util: 0.7, inactivity_timeout: 300, autoscaler_instance: "prod"
   }'
 }

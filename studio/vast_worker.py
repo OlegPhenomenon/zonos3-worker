@@ -12,15 +12,22 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
                                        {durationMs, headS, speechHead} (not when the caller says haveHead), then
                                        {audioHash, durationMs, speechStem, timings, cached}
   /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
+  /mix_plan  {audioHash, rows: [{start, end, speaker}], voices: {speaker: voice}, samples: {voice: flac}}
+                                    -> {"pending": true} | {"ready": true}: the draft's mix analyses (the lab's mix_plan.py build:
+                                       channel, defects, rooms, locations) of the whole file's stems (else the head's), measured
+                                       once in the background against a reference dub of the voices; asked again for the
+                                       whole file once it is separated
   /mix_piece {audioHash, startS, rate, frames, dub: flac, nonverbal: flac, summary: json text}
                                     -> {mix: flac (stereo, `rate`, `frames` samples), timings}: the piece of the video from startS,
                                        its stems and original sound cut from the cache (from the head's while the whole file is
-                                       still being separated, for a piece inside the head), mixed by mix_clip.py netflix
+                                       still being separated, for a piece inside the head), mixed by mix_clip.py netflix on the
+                                       plan's analyses (cut to the piece: mix_plan.py slice; a plan still being measured is
+                                       waited for up to PLAN_WAIT_S), else on the piece's own
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
 download_failed, prepare_failed, ser_failed, mix_failed.
 
-Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json}, least recently used evicted
+Disk cache: CACHE_DIR/<audioHash>/ {mix.flac, speech.flac, bg.flac, speech.opus, prepare.json, plan/}, least recently used evicted
 above STUDIO_CACHE_GB (default 40). The directory appears atomically (renamed from <hash>.tmp) only after a complete prepare.
 CACHE_DIR/<audioHash>.head/ holds the same files for the first HEAD_S + HEAD_PAD_S of a long file, separated first: the separator
 works in 8 s chunks with no state across them, so up to HEAD_S + HEAD_PAD_S - 8 s the head's stems are the whole file's.
@@ -56,6 +63,9 @@ _gpu = threading.Lock()      # one separation at a time: the model owns the card
 _cpu = ThreadPoolExecutor(max_workers=12, thread_name_prefix='studio-cpu')
 _prepare_jobs: dict[str, asyncio.Future] = {}  # audioHash -> preparation running in the background (/prepare answers pending)
 _prepare_slot = threading.Lock()
+_plan_jobs: dict[str, 'concurrent.futures.Future'] = {}  # stems dir -> mix plan being measured
+_plan_lock = threading.Lock()
+PLAN_WAIT_S = 90  # a piece waits this long for a plan being measured, then is measured on its own (the lab's way)
 
 
 class EarliestFirst:
@@ -388,6 +398,116 @@ async def ser(**p) -> dict:
         return answer_error(e)
 
 
+# ---------------------------------------------------------------- /mix_plan
+# A plan is measured on a stems dir: on all of it ('plan') or, asked with untilS, on its first untilS seconds ('plan_start': the
+# video's first pieces get theirs in a fraction of the time). One measurement at a time, in the order asked.
+PLANS = ('plan', 'plan_start')
+_plan_run = threading.Lock()
+_plan_until: dict[str, float] = {}  # plan being measured -> seconds it will cover
+
+
+def plan_data(d: Path, name: str) -> Path:
+    return d / name / 'data'
+
+
+def plan_covers(d: Path, name: str) -> float:
+    """Seconds from the start a ready plan covers (0: not ready)."""
+    f = plan_data(d, name) / 'exp' / 'plan' / 'iso' / 'netflix' / 'plan.json'
+    return json.loads(f.read_text())['duration_s'] if f.exists() else 0.0
+
+
+def to_wav(src: Path, dst: Path, channels: int, what: str, until_s: float | None = None) -> None:
+    run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src)] + (['-t', f'{until_s:.3f}'] if until_s else []) +
+        ['-ac', str(channels), '-ar', '44100', str(dst)], what, 300)
+
+
+def plan_blocking(d: Path, name: str, until_s: float | None, p: dict) -> None:
+    with _plan_run:
+        tmp = d / f'{name}.tmp'
+        shutil.rmtree(tmp, ignore_errors=True)
+        clip = tmp / 'data' / 'exp' / 'plan'
+        clip.mkdir(parents=True)
+        t0 = time.time()
+        try:
+            with using(d.name):
+                to_wav(d / 'mix.flac', clip / 'mix.wav', 2, 'mix_failed', until_s)
+                to_wav(d / 'speech.flac', clip / 'bandit_speech.flac', 2, 'mix_failed', until_s)
+                to_wav(d / 'bg.flac', clip / 'bandit_bg.flac', 2, 'mix_failed', until_s)
+                samples = tmp / 'samples'
+                samples.mkdir()
+                for voice, b64 in p['samples'].items():
+                    (samples / f'{voice}.flac').write_bytes(decode_b64(b64, voice))
+                    to_wav(samples / f'{voice}.flac', samples / f'{voice}.wav', 1, 'bad_request')
+                (tmp / 'rows.json').write_text(json.dumps(p['rows']))
+                (tmp / 'voices.json').write_text(json.dumps(p['voices']))
+                env = {**os.environ, 'LAB_DATA': str(tmp / 'data')}
+                r = subprocess.run(['python3', str(LAB / 'mix_plan.py'), 'build', str(tmp / 'data'), str(tmp / 'rows.json'),
+                                    str(tmp / 'voices.json'), str(samples)], cwd=str(LAB), env=env, capture_output=True, text=True, timeout=1800)
+                if r.returncode:
+                    raise Fail('mix_failed', r.stderr[-600:])
+                shutil.rmtree(d / name, ignore_errors=True)
+                tmp.rename(d / name)
+            log.info('mix %s %s: %s in %.1f s', name, d.name, r.stdout.strip()[-200:], time.time() - t0)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            log.exception('mix %s %s failed', name, d.name)
+            raise
+
+
+def plan_dir_for(p: dict) -> Path:
+    """The stems a plan is measured on: the whole file's once separated, else the head's."""
+    h = need_hash(p)
+    for d, marker in ((stems_dir(h), 'prepare.json'), (head_dir(h), 'head.json')):
+        if (d / marker).exists():
+            return d
+    raise Fail('not_prepared', h)
+
+
+async def mix_plan(**p) -> dict:
+    try:
+        d = plan_dir_for(p)
+        if not isinstance(p.get('rows'), list) or not isinstance(p.get('voices'), dict) or not isinstance(p.get('samples'), dict):
+            raise Fail('bad_request', 'rows, voices and samples required')
+        until_s = p.get('untilS')
+        if until_s is not None and (not isinstance(until_s, (int, float)) or until_s <= 0):
+            raise Fail('bad_request', 'untilS must be a positive number')
+        name = 'plan_start' if until_s else 'plan'
+        if plan_covers(d, name):
+            return {'ready': True}
+        with _plan_lock:
+            job = _plan_jobs.get(f'{d}/{name}')
+            if job is None or (job.done() and job.exception() is not None):
+                job = _plan_jobs[f'{d}/{name}'] = _cpu.submit(plan_blocking, d, name, until_s, p)
+                _plan_until[f'{d}/{name}'] = float(until_s or 'inf')
+        return {'pending': True}
+    except Fail as e:
+        return answer_error(e)
+
+
+def plan_for(d: Path, p: dict, end_s: float) -> Path | None:
+    """The plan a piece up to end_s uses: a ready one that covers it, the whole one first (of its stems dir, else of the head's
+    for a piece inside the head); else one being measured that will cover it, waited for up to PLAN_WAIT_S; else none (the piece
+    is measured on its own)."""
+    dirs = [d]
+    hd = head_dir(need_hash(p))
+    if hd != d and end_s <= HEAD_S + HEAD_PAD_S - 8:
+        dirs.append(hd)
+    plans = [(x, name) for x in dirs for name in PLANS]
+    for x, name in plans:
+        if plan_covers(x, name) >= end_s - 0.5:
+            return plan_data(x, name)
+    for x, name in reversed(plans):  # the start's plan (sooner) before the whole one
+        with _plan_lock:
+            job = _plan_jobs.get(f'{x}/{name}')
+            until_s = _plan_until.get(f'{x}/{name}', 0.0)
+        if job is not None and not job.done() and until_s >= end_s - 0.5:
+            with contextlib.suppress(Exception):
+                job.result(timeout=PLAN_WAIT_S)
+            if plan_covers(x, name) >= end_s - 0.5:
+                return plan_data(x, name)
+    return None
+
+
 # ---------------------------------------------------------------- /mix_piece
 def cut(src: Path, start_s: float, rate: int, frames: int, channels: int, dst: Path) -> None:
     """`frames` samples at `rate` of src from start_s (resampled first, then padded / trimmed to the exact length)."""
@@ -404,6 +524,7 @@ def mix_piece_blocking(p: dict) -> dict:
     if start_s < 0 or rate not in (44100, 48000) or not 0 < frames <= MAX_PIECE_S * rate or 'report' not in summary:
         raise Fail('bad_request', f'need startS >= 0, rate 44100|48000, 0 < frames <= {MAX_PIECE_S} s, a summary with report')
     d = stems_for(p, start_s + frames / rate)
+    plan = plan_for(d, p, start_s + frames / rate)
     t0 = time.time()
     with using(d.name), _mix_slots.slot(start_s):
         tmp = Path(tempfile.mkdtemp(dir=CACHE_DIR, prefix='piece-'))
@@ -419,8 +540,10 @@ def mix_piece_blocking(p: dict) -> dict:
                 run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src), '-ac', '1', '-ar', str(rate), str(clip / 'iso' / name)],
                     'bad_request', 120)
             (clip / 'iso' / 'summary.json').write_text(json.dumps(summary))
-            t_in = time.time() - t0
             env = {**os.environ, 'LAB_DATA': str(tmp / 'data')}
+            if plan is not None:
+                run(['python3', str(LAB / 'mix_plan.py'), 'slice', str(plan), str(tmp / 'data'), 'piece', f'{start_s:.6f}'], 'mix_failed', 120)
+            t_in = time.time() - t0
             r = subprocess.run(['python3', str(LAB / 'mix_clip.py'), 'piece', 'netflix'], cwd=str(LAB), env=env,
                                capture_output=True, text=True, timeout=1800)
             if r.returncode:
@@ -430,7 +553,7 @@ def mix_piece_blocking(p: dict) -> dict:
             run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(clip / 'iso' / 'mix_netflix.wav'), '-c:a', 'flac', str(flac)],
                 'mix_failed', 120)
             return {'mix': base64.b64encode(flac.read_bytes()).decode(),
-                    'timings': {'inputs_s': round(t_in, 2), 'total_s': round(time.time() - t0, 2), 'stages': stages}}
+                    'timings': {'inputs_s': round(t_in, 2), 'total_s': round(time.time() - t0, 2), 'stages': stages, 'plan': plan is not None}}
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -502,6 +625,7 @@ def main():
                       workload_calculator=lambda p: float(p.get('durationMs') or 600000) / 1000, **common),
         HandlerConfig(route='/ser', remote_function=ser,
                       workload_calculator=lambda p: UNITS_PER_WORKER_S * SER_S_PER_CLIP * max(1, len(p.get('clips') or {})), **common),
+        HandlerConfig(route='/mix_plan', remote_function=mix_plan, workload_calculator=lambda p: UNITS_PER_WORKER_S, **common),
         HandlerConfig(route='/mix_piece', remote_function=mix_piece,
                       workload_calculator=lambda p: UNITS_PER_WORKER_S * float(p.get('frames') or 0) / float(p.get('rate') or 44100), **common)])).run()
 
