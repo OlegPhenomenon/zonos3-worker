@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent Vast.ai Serverless setup for the studio-prep worker (endpoint + workergroup), docs/architecture/studio-dub-realtime.md.
-# The scoped key cannot create templates, so the workergroup carries the launch command itself (launch_args), as the interim
-# zonos3-tts-emo endpoint did. Re-running updates both in place.
+# The scoped key cannot create templates, so the workergroup carries the launch command itself (launch_args), as the prod
+# zonos3-tts workergroup does. Re-running updates both in place.
 #
 #   VAST_API_KEY=… scripts/studio_setup.sh <image tag>      e.g. studio-<sha>
 #
