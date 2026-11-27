@@ -13,24 +13,24 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
                                        {audioHash, durationMs, speechStem, backgroundStem, timings, cached}; the background
                                        (mix - speech, stereo ogg/opus 96 kbit/s) is what the per-cue path plays under its lines
   /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
-  /mix_plan  {audioHash, rows: [{start, end, speaker}], voices: {speaker: voice}, samples: {voice: flac}}
+  /mix_plan  {audioHash, rows: [{start, end, speaker}], voices: {speaker: voice}, samples: {voice: flac}, untilS?, windows?}
                                     -> {"pending": true} | {"ready": true}: the draft's mix analyses (the lab's mix_plan.py build:
                                        channel, defects, rooms, locations, perspective) of the whole file's stems (else the
                                        head's), measured once in the background against a reference dub of the voices; asked
-                                       again for the whole file once it is separated. A stream window (<job>_w<k>) is its own
-                                       file: its plan is what its lines' /mix_cue renders on
+                                       again for the whole file once it is separated. A stream video (<job>_video) names its
+                                       windows instead of a file ([{audioHash: <job>_w<k>, fromS, toS}]: each window's own range,
+                                       prepared here): their stems are joined into its stems dir first (join_windows)
   /mix_piece {audioHash, startS, rate, frames, dub: flac, nonverbal: flac, summary: json text}
                                     -> {mix: flac (stereo, `rate`, `frames` samples), timings}: the piece of the video from startS,
                                        its stems and original sound cut from the cache (from the head's while the whole file is
                                        still being separated, for a piece inside the head), mixed by mix_clip.py netflix on the
                                        plan's analyses (cut to the piece: mix_plan.py slice; a plan still being measured is
                                        waited for up to PLAN_WAIT_S), else on the piece's own
-  /mix_cue   {audioHash, startS, endS, dub: audio, netflix?, dubStartS?, tailEndS?, planWaitS?}
-                                    -> {mix: flac (stereo 44.1 kHz), netflix: "own" | "borrowed" | false, timings}: one dub line
-                                       mixed against the original voice of its slot. With netflix and the file's plan (the
-                                       whole file's or its start's; ready, or ready within planWaitS <= LINE_PLAN_WAIT_S),
-                                       else the plan of the nearest window of the same stream job (<job>_w<k>, borrowed: its
-                                       room, tone, dynamics): the draft's netflix voice chain (the lab's mix_line.py: level,
+  /mix_cue   {audioHash, startS, endS, dub: audio, netflix?, planHash?, planOffsetS?, dubStartS?, tailEndS?, planWaitS?}
+                                    -> {mix: flac (stereo 44.1 kHz), netflix: "video" | false, timings}: one dub line mixed against
+                                       the original voice of its slot. With netflix and the plan of planHash (a stream video's;
+                                       ready, or ready within planWaitS <= LINE_PLAN_WAIT_S; planOffsetS: where the window
+                                       starts in the plan's time): the draft's netflix voice chain (the lab's mix_line.py: level,
                                        the location's tone and room, dynamics, perspective; the take placed at dubStartS, its
                                        room tail kept up to tailEndS), ~0.2 s; else the dry treatment (the lab's mix_cue.py:
                                        level, tone, balance; no room, the take's length), tens of milliseconds
@@ -491,8 +491,69 @@ def plan_dir_for(p: dict) -> Path:
     raise Fail('not_prepared', h)
 
 
+_join_lock = threading.Lock()
+
+
+def join_windows(p: dict) -> None:
+    """A stream video's plan stems (CACHE_DIR/<audioHash>: mix, speech, bg) joined from its windows' stems, prepared on this
+    worker: `windows` [{audioHash, fromS, toS}] in order, each window's own range in its own seconds. Written once and
+    atomically like a prepare (prepare.json last), so /mix_plan measures it as any prepared file."""
+    import soundfile as sf
+    h = need_hash(p)
+    final = stems_dir(h)
+    wins = p.get('windows')
+    if not isinstance(wins, list) or not wins:
+        raise Fail('bad_request', 'windows must be a non-empty list')
+    with _join_lock:
+        if (final / 'prepare.json').exists():
+            return
+        parts = []
+        for w in wins:
+            wd = stems_dir(need_hash(w))
+            try:
+                a, b = float(w['fromS']), float(w['toS'])
+            except (KeyError, TypeError, ValueError) as e:
+                raise Fail('bad_request', f'windows: {e!r}')
+            if not (wd / 'prepare.json').exists():
+                raise Fail('not_prepared', w['audioHash'])
+            if not 0 <= a < b:
+                raise Fail('bad_request', 'windows: need 0 <= fromS < toS')
+            parts.append((wd, a, b))
+        tmp = CACHE_DIR / f'{h}.tmp'
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        try:
+            frames, rate = 0, None
+            for name in ('mix.flac', 'speech.flac', 'bg.flac'):
+                out, n = None, 0
+                for wd, a, b in parts:
+                    with using(wd.name):
+                        info = sf.info(str(wd / name))
+                        x, rate = sf.read(str(wd / name), start=int(a * info.samplerate), stop=int(b * info.samplerate),
+                                          dtype='float32', always_2d=True)
+                    if out is None:
+                        out = sf.SoundFile(str(tmp / name), 'w', samplerate=rate, channels=x.shape[1], format='FLAC',
+                                           subtype=info.subtype)
+                    out.write(x)
+                    n += len(x)
+                out.close()
+                frames = n
+            (tmp / 'prepare.json').write_text(json.dumps({'durationMs': round(frames * 1000 / rate), 'joined': wins}))
+            shutil.rmtree(final, ignore_errors=True)
+            tmp.rename(final)
+        except Fail:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        except Exception as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            log.exception('join %s failed', h)
+            raise Fail('mix_failed', repr(e))
+
+
 async def mix_plan(**p) -> dict:
     try:
+        if p.get('windows') is not None:
+            await asyncio.get_running_loop().run_in_executor(_cpu, join_windows, p)
         d = plan_dir_for(p)
         if not isinstance(p.get('rows'), list) or not isinstance(p.get('voices'), dict) or not isinstance(p.get('samples'), dict):
             raise Fail('bad_request', 'rows, voices and samples required')
@@ -594,10 +655,9 @@ async def mix_piece(**p) -> dict:
 
 
 # ---------------------------------------------------------------- /mix_cue
-LINE_PLAN_WAIT_S = 20  # longest a line waits for its window's plan still being measured (the caller's planWaitS, capped)
-LINE_PLANS = 12        # loaded window plans kept in memory (a few windows of a few viewers)
-WINDOW_RE = re.compile(r'^(?P<job>[A-Za-z0-9_-]+)_w(?P<k>\d+)$')  # a stream window's stems: <job>_w<k>
-_line_plans: dict[tuple[str, str], object] = {}
+LINE_PLAN_WAIT_S = 20  # longest a line waits for its video's plan still being measured (the caller's planWaitS, capped)
+LINE_PLANS = 12        # loaded (plan, window) pairs kept in memory (a few windows of a few viewers)
+_line_plans: dict[tuple[str, str, float], object] = {}
 _line_plans_lock = threading.Lock()
 
 
@@ -606,51 +666,34 @@ def ready_plan(d: Path) -> Path | None:
     return next((plan_data(d, name) for name in PLANS if plan_covers(d, name)), None)
 
 
-def borrowed_plan(d: Path) -> Path | None:
-    """The ready plan of the nearest other window of the same stream job (<job>_w<k>), None for none or not a window."""
-    m = WINDOW_RE.match(d.name)
-    if not m:
-        return None
-    found = []
-    for other in CACHE_DIR.glob(f"{m['job']}_w*"):
-        mo = WINDOW_RE.match(other.name)
-        if other != d and mo and mo['job'] == m['job'] and (path := ready_plan(other)) is not None:
-            found.append((abs(int(mo['k']) - int(m['k'])), int(mo['k']) > int(m['k']), str(path)))
-    return Path(min(found)[2]) if found else None
-
-
-BORROW_WAIT_S = 3  # with another window's plan to borrow, a line waits only this long for its own window's
-
-
-def line_plan(d: Path, wait_s: float):
-    """(plan, own) for a line of the window d (the lab's mix_line.Plan): its own plan when ready or ready within wait_s
-    (BORROW_WAIT_S when another window's can be borrowed); else the plan of the nearest window of the same job, borrowed
-    (its room, tone and dynamics; the window's own stem) - the first lines of a window come before its measurement ends,
-    and one video's windows are mostly one room; else None (the line is mixed dry)."""
-    path = ready_plan(d)
-    borrow = borrowed_plan(d) if path is None else None
+def line_plan(d: Path, plan_hash: str, offset_s: float, wait_s: float):
+    """The lab's mix_line.Plan for a line of the stream window d: the plan of the video (/mix_plan of plan_hash, its windows'
+    stems joined: the draft measured its room on the whole clip, a window's first 15-30 s gave none), read in the window's
+    time (offset_s: the window's start in the plan's time) against the window's own stem; ready, or ready within wait_s;
+    else None (the line is mixed dry)."""
+    pd = stems_dir(plan_hash)
+    path = ready_plan(pd)
     if path is None and wait_s > 0:
         with _plan_lock:
-            jobs = [j for name in PLANS if (j := _plan_jobs.get(f'{d}/{name}')) is not None and not j.done()]
+            jobs = [j for name in PLANS if (j := _plan_jobs.get(f'{pd}/{name}')) is not None and not j.done()]
         if jobs:
             with contextlib.suppress(Exception):
-                jobs[0].result(timeout=min(wait_s, BORROW_WAIT_S) if borrow else wait_s)
-            path = ready_plan(d)
-    own = path is not None
-    path = path if own else (borrow or borrowed_plan(d))
+                jobs[0].result(timeout=wait_s)
+            path = ready_plan(pd)
     if path is None:
-        return None, False
-    key = (str(path), str(d))
+        return None
+    key = (str(path), str(d), offset_s)
     with _line_plans_lock:
         plan = _line_plans.get(key)
     if plan is None:
         import mix_line
-        plan = mix_line.Plan(str(path), str(d / 'speech.flac'), own=own)
+        with using(pd.name):
+            plan = mix_line.Plan(str(path), str(d / 'speech.flac'), offset_s)
         with _line_plans_lock:
             _line_plans[key] = plan
             while len(_line_plans) > LINE_PLANS:
                 _line_plans.pop(next(iter(_line_plans)))
-    return plan, own
+    return plan
 
 
 def mix_cue_blocking(p: dict) -> dict:
@@ -683,17 +726,21 @@ def mix_cue_blocking(p: dict) -> dict:
         dub = resample_poly(dub, lab_mix.SR, rate).astype(np.float32)
     take_s = len(dub) / lab_mix.SR
     d = stems_for(p, max(end_s, dub_start + take_s))  # the context is cut to what the stems hold
-    if p.get('netflix'):
+    if p.get('netflix') and p.get('planHash') is not None:
+        try:
+            plan_hash, offset_s = need_hash({'audioHash': p['planHash']}), float(p.get('planOffsetS') or 0.0)
+        except (TypeError, ValueError) as e:
+            raise Fail('bad_request', repr(e))
         t_plan = time.time()
-        with using(d.name):  # the window's stem is read when its plan is first loaded
-            plan, own = line_plan(d, plan_wait)
+        with using(d.name):  # the window's stem is read when the plan is first loaded for it
+            plan = line_plan(d, plan_hash, offset_s, plan_wait)
         waited = time.time() - t_plan
         if plan is not None:
             import mix_line
             out = mix_line.render(plan, start_s, end_s, dub, dub_start, tail_end)
             buf = io.BytesIO()
             sf.write(buf, out.T, lab_mix.SR, format='FLAC', subtype='PCM_16')
-            return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': 'own' if own else 'borrowed',
+            return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': 'video',
                     'timings': {'total_s': round(time.time() - t0, 3), 'plan_wait_s': round(waited, 2)}}
     half = max(take_s, end_s - start_s, lab_mix.CONTEXT_S) / 2 + 1
     mid = start_s + (end_s - start_s) / 2
