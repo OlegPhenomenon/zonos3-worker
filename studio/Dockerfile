@@ -68,6 +68,7 @@ COPY lab/ /app/lab/
 ENV STUDIO_LAB=/app/lab
 RUN cd /app/lab && python3 -c 'import mix_clip, dub_mix, channel_match, recording_defects, room_layers, perspective, netflix_channel, emotion_ser' \
  && cat LAB_REF
-COPY __init__.py sep.py vast_worker.py /app/studio/
+COPY __init__.py sep.py vast_worker.py runpod_lb.py /app/studio/
 COPY assets/ /app/studio/assets/
-ENTRYPOINT ["/bin/sh","-c","cd /app && exec python3 -u -m studio.vast_worker"]
+# No argument: the Vast PyWorker; `runpod-lb`: the RunPod load-balancing server (runpod_lb.py, the fallback pool).
+ENTRYPOINT ["/bin/sh","-c","cd /app && if [ \"$0\" = runpod-lb ]; then exec python3 -u -m studio.runpod_lb; else exec python3 -u -m studio.vast_worker; fi"]

@@ -11,6 +11,9 @@ steps next to the stems. Image `ghcr.io/olegphenomenon/zonos3-worker:studio-<sha
   cached stems and original, with the runner's dub of the piece), remote dispatch like `slim/`, disk cache `STUDIO_CACHE_DIR/<audioHash>/`
   with LRU cap `STUDIO_CACHE_GB` (40). Failures are answers `{"error": code, "detail"}` (HTTP 200), codes in the module docstring.
   The worker refuses to start when either model returns non-finite output or runs without CUDA.
+- `runpod_lb.py` – the same routes as a plain HTTP server for a RunPod load-balancing endpoint (argument `runpod-lb`,
+  `GET /ping` 204 while loading, 200 when ready): the fallback endpoint `studio-prep-fallback` (max 1 worker, so every
+  request of a job reaches the worker holding its stems) that the runner uses when Vast has no worker.
 - `sep.py` – dialogue/rest separation: Bandit v2 (multi) on ONNX Runtime GPU, no PyTorch. Speech branch only; `bg = mix - speech`.
   Chunks of 8 s, hop `SEP_HOP_S` (4), batch `SEP_BATCH` (2: ~2.9 GB GPU), fp16 weights with fp32 I/O.
 - `tool/export_bandit.py` – how `bandit_speech.onnx` is made (needs a clone of kwatcharasupat/bandit-v2 and the Zenodo checkpoint,

@@ -11,7 +11,9 @@ bit for bit against Ubuntu's ffmpeg on every clip) + prebuilt `zonos3-server` (r
 + `backbone-ptq.gguf`, `zac-keep2.gguf`, `spk-encoder.gguf`, `steer.gguf` (~1.2 GB) + the voice bank clips (Opus, ~33 MB). Python carries only what the
 PyWorker imports (no pip, no `vastai` CLI/SDK tree, see the `pydeps` stage).
 Argument `vast` starts the Vast PyWorker (port 3000, route `/tts`); no argument starts the RunPod handler, which needs
-`docker build --build-arg RUNPOD=1` (the `runpod` package is not in the default image).
+`docker build --build-arg RUNPOD=1` (the `runpod` package is not in the default image). Argument `runpod-lb` starts
+`runpod_lb.py`, the RunPod load-balancing server (`GET /ping`, `POST /tts` with the payload as the body and the Vast answer as
+the response) of the fallback endpoint `zonos3-tts-fallback` the app uses when Vast has no worker.
 
 Request payload (Vast: `{"auth_data": <route answer>, "payload": {...}}`; RunPod: `input`):
 

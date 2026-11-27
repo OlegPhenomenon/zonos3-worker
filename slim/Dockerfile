@@ -116,7 +116,8 @@ RUN missing=$(for f in /app/build/zonos3-server $(find /app/build -name '*.so*')
 COPY --from=ffcheck /ffmpeg-ok /usr/local/bin/ffmpeg
 COPY voices/ /app/voices/
 RUN ffmpeg -nostdin -v error -i /app/voices/ru/Charon.ogg -ac 1 -ar 44100 -f f32le - >/dev/null
-COPY common.py prosody.py handler.py vast_worker.py /app/
-# `vast` runs the Vast PyWorker; anything else (RunPod) the RunPod handler.
-ENTRYPOINT ["/bin/sh","-c","cd /app && if [ \"$0\" = vast ]; then exec python3 -u vast_worker.py; else exec python3 -u handler.py; fi"]
+COPY common.py prosody.py handler.py vast_worker.py runpod_lb.py /app/
+# `vast` runs the Vast PyWorker, `runpod-lb` the RunPod load-balancing server (runpod_lb.py, the fallback pool); anything
+# else (RunPod queue) the RunPod handler.
+ENTRYPOINT ["/bin/sh","-c","cd /app && case \"$0\" in vast) exec python3 -u vast_worker.py;; runpod-lb) exec python3 -u runpod_lb.py;; *) exec python3 -u handler.py;; esac"]
 CMD ["runpod"]
