@@ -26,11 +26,13 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
                                        plan's analyses (cut to the piece: mix_plan.py slice; a plan still being measured is
                                        waited for up to PLAN_WAIT_S), else on the piece's own
   /mix_cue   {audioHash, startS, endS, dub: audio, netflix?, dubStartS?, tailEndS?, planWaitS?}
-                                    -> {mix: flac (stereo 44.1 kHz), netflix: bool, timings}: one dub line mixed against the
-                                       original voice of its slot. With netflix and the file's plan (ready, or ready within
-                                       planWaitS <= LINE_PLAN_WAIT_S): the draft's netflix voice chain (the lab's mix_line.py:
-                                       level, the location's tone and room, dynamics, perspective; the take placed at dubStartS,
-                                       its room tail kept up to tailEndS), ~0.2 s; else the dry treatment (the lab's mix_cue.py:
+                                    -> {mix: flac (stereo 44.1 kHz), netflix: "own" | "borrowed" | false, timings}: one dub line
+                                       mixed against the original voice of its slot. With netflix and the file's plan (the
+                                       whole file's or its start's; ready, or ready within planWaitS <= LINE_PLAN_WAIT_S),
+                                       else the plan of the nearest window of the same stream job (<job>_w<k>, borrowed: its
+                                       room, tone, dynamics): the draft's netflix voice chain (the lab's mix_line.py: level,
+                                       the location's tone and room, dynamics, perspective; the take placed at dubStartS, its
+                                       room tail kept up to tailEndS), ~0.2 s; else the dry treatment (the lab's mix_cue.py:
                                        level, tone, balance; no room, the take's length), tens of milliseconds
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
@@ -594,33 +596,57 @@ async def mix_piece(**p) -> dict:
 # ---------------------------------------------------------------- /mix_cue
 LINE_PLAN_WAIT_S = 20  # longest a line waits for its window's plan still being measured (the caller's planWaitS, capped)
 LINE_PLANS = 12        # loaded window plans kept in memory (a few windows of a few viewers)
-_line_plans: dict[str, object] = {}
+WINDOW_RE = re.compile(r'^(?P<job>[A-Za-z0-9_-]+)_w(?P<k>\d+)$')  # a stream window's stems: <job>_w<k>
+_line_plans: dict[tuple[str, str], object] = {}
 _line_plans_lock = threading.Lock()
 
 
+def ready_plan(d: Path) -> Path | None:
+    """A ready plan of these stems: the whole file's, else the one of its start (untilS)."""
+    return next((plan_data(d, name) for name in PLANS if plan_covers(d, name)), None)
+
+
+def borrowed_plan(d: Path) -> Path | None:
+    """The ready plan of the nearest other window of the same stream job (<job>_w<k>), None for none or not a window."""
+    m = WINDOW_RE.match(d.name)
+    if not m:
+        return None
+    found = []
+    for other in CACHE_DIR.glob(f"{m['job']}_w*"):
+        mo = WINDOW_RE.match(other.name)
+        if other != d and mo and mo['job'] == m['job'] and (path := ready_plan(other)) is not None:
+            found.append((abs(int(mo['k']) - int(m['k'])), int(mo['k']) > int(m['k']), str(path)))
+    return Path(min(found)[2]) if found else None
+
+
 def line_plan(d: Path, wait_s: float):
-    """The window's plan loaded for its lines (the lab's mix_line.Plan) when its measurement is ready or finishes within
-    wait_s, else None (the line is mixed dry, as before)."""
-    if not plan_covers(d, 'plan'):
+    """(plan, own) for a line of the window d (the lab's mix_line.Plan): its own plan when ready or ready within wait_s; else
+    the plan of the nearest window of the same job, borrowed (its room, tone and dynamics; the window's own stem) - the
+    first lines of a window come before its measurement ends, and one video's windows are mostly one room; else None (the
+    line is mixed dry)."""
+    path = ready_plan(d)
+    if path is None and wait_s > 0:
         with _plan_lock:
-            job = _plan_jobs.get(f'{d}/plan')
-        if job is None or wait_s <= 0:
-            return None
-        with contextlib.suppress(Exception):
-            job.result(timeout=wait_s)
-        if not plan_covers(d, 'plan'):
-            return None
-    path = str(plan_data(d, 'plan'))
+            jobs = [j for name in PLANS if (j := _plan_jobs.get(f'{d}/{name}')) is not None and not j.done()]
+        if jobs:
+            with contextlib.suppress(Exception):
+                jobs[0].result(timeout=wait_s)
+            path = ready_plan(d)
+    own = path is not None
+    path = path if own else borrowed_plan(d)
+    if path is None:
+        return None, False
+    key = (str(path), str(d))
     with _line_plans_lock:
-        plan = _line_plans.get(path)
+        plan = _line_plans.get(key)
     if plan is None:
         import mix_line
-        plan = mix_line.Plan(path)
+        plan = mix_line.Plan(str(path), str(d / 'speech.flac'), own=own)
         with _line_plans_lock:
-            _line_plans[path] = plan
+            _line_plans[key] = plan
             while len(_line_plans) > LINE_PLANS:
                 _line_plans.pop(next(iter(_line_plans)))
-    return plan
+    return plan, own
 
 
 def mix_cue_blocking(p: dict) -> dict:
@@ -655,14 +681,15 @@ def mix_cue_blocking(p: dict) -> dict:
     d = stems_for(p, max(end_s, dub_start + take_s))  # the context is cut to what the stems hold
     if p.get('netflix'):
         t_plan = time.time()
-        plan = line_plan(d, plan_wait)
+        with using(d.name):  # the window's stem is read when its plan is first loaded
+            plan, own = line_plan(d, plan_wait)
         waited = time.time() - t_plan
         if plan is not None:
             import mix_line
             out = mix_line.render(plan, start_s, end_s, dub, dub_start, tail_end)
             buf = io.BytesIO()
             sf.write(buf, out.T, lab_mix.SR, format='FLAC', subtype='PCM_16')
-            return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': True,
+            return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': 'own' if own else 'borrowed',
                     'timings': {'total_s': round(time.time() - t0, 3), 'plan_wait_s': round(waited, 2)}}
     half = max(take_s, end_s - start_s, lab_mix.CONTEXT_S) / 2 + 1
     mid = start_s + (end_s - start_s) / 2
