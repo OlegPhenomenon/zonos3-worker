@@ -619,21 +619,25 @@ def borrowed_plan(d: Path) -> Path | None:
     return Path(min(found)[2]) if found else None
 
 
+BORROW_WAIT_S = 3  # with another window's plan to borrow, a line waits only this long for its own window's
+
+
 def line_plan(d: Path, wait_s: float):
-    """(plan, own) for a line of the window d (the lab's mix_line.Plan): its own plan when ready or ready within wait_s; else
-    the plan of the nearest window of the same job, borrowed (its room, tone and dynamics; the window's own stem) - the
-    first lines of a window come before its measurement ends, and one video's windows are mostly one room; else None (the
-    line is mixed dry)."""
+    """(plan, own) for a line of the window d (the lab's mix_line.Plan): its own plan when ready or ready within wait_s
+    (BORROW_WAIT_S when another window's can be borrowed); else the plan of the nearest window of the same job, borrowed
+    (its room, tone and dynamics; the window's own stem) - the first lines of a window come before its measurement ends,
+    and one video's windows are mostly one room; else None (the line is mixed dry)."""
     path = ready_plan(d)
+    borrow = borrowed_plan(d) if path is None else None
     if path is None and wait_s > 0:
         with _plan_lock:
             jobs = [j for name in PLANS if (j := _plan_jobs.get(f'{d}/{name}')) is not None and not j.done()]
         if jobs:
             with contextlib.suppress(Exception):
-                jobs[0].result(timeout=wait_s)
+                jobs[0].result(timeout=min(wait_s, BORROW_WAIT_S) if borrow else wait_s)
             path = ready_plan(d)
     own = path is not None
-    path = path if own else borrowed_plan(d)
+    path = path if own else (borrow or borrowed_plan(d))
     if path is None:
         return None, False
     key = (str(path), str(d))
