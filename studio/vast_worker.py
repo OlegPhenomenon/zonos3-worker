@@ -15,19 +15,23 @@ Routes (payload -> answer, all JSON; the SDK wraps the answer as {"result": answ
   /ser       {clips: {id: flac}}    -> {probs: {id: {label: p}}}  (emotion2vec+ large; audioHash not needed)
   /mix_plan  {audioHash, rows: [{start, end, speaker}], voices: {speaker: voice}, samples: {voice: flac}}
                                     -> {"pending": true} | {"ready": true}: the draft's mix analyses (the lab's mix_plan.py build:
-                                       channel, defects, rooms, locations) of the whole file's stems (else the head's), measured
-                                       once in the background against a reference dub of the voices; asked again for the
-                                       whole file once it is separated
+                                       channel, defects, rooms, locations, perspective) of the whole file's stems (else the
+                                       head's), measured once in the background against a reference dub of the voices; asked
+                                       again for the whole file once it is separated. A stream window (<job>_w<k>) is its own
+                                       file: its plan is what its lines' /mix_cue renders on
   /mix_piece {audioHash, startS, rate, frames, dub: flac, nonverbal: flac, summary: json text}
                                     -> {mix: flac (stereo, `rate`, `frames` samples), timings}: the piece of the video from startS,
                                        its stems and original sound cut from the cache (from the head's while the whole file is
                                        still being separated, for a piece inside the head), mixed by mix_clip.py netflix on the
                                        plan's analyses (cut to the piece: mix_plan.py slice; a plan still being measured is
                                        waited for up to PLAN_WAIT_S), else on the piece's own
-  /mix_cue   {audioHash, startS, endS, dub: audio}
-                                    -> {mix: flac (stereo 44.1 kHz, the take's length), timings}: one dub line of the per-cue path
-                                       mixed against the original voice of its slot (the lab's mix_cue.py: level, tone, balance;
-                                       no room), tens of milliseconds
+  /mix_cue   {audioHash, startS, endS, dub: audio, netflix?, dubStartS?, tailEndS?, planWaitS?}
+                                    -> {mix: flac (stereo 44.1 kHz), netflix: bool, timings}: one dub line mixed against the
+                                       original voice of its slot. With netflix and the file's plan (ready, or ready within
+                                       planWaitS <= LINE_PLAN_WAIT_S): the draft's netflix voice chain (the lab's mix_line.py:
+                                       level, the location's tone and room, dynamics, perspective; the take placed at dubStartS,
+                                       its room tail kept up to tailEndS), ~0.2 s; else the dry treatment (the lab's mix_cue.py:
+                                       level, tone, balance; no room, the take's length), tens of milliseconds
 Binary values are base64. A failure is an answer {"error": "<code>", "detail": "..."} (the SDK turns an exception into a bare 500, and
 a remote-dispatch answer is always HTTP 200). Codes: bad_request, not_prepared (unknown audioHash: run /prepare), too_long,
 download_failed, prepare_failed, ser_failed, mix_failed.
@@ -420,9 +424,11 @@ async def ser(**p) -> dict:
 
 # ---------------------------------------------------------------- /mix_plan
 # A plan is measured on a stems dir: on all of it ('plan') or, asked with untilS, on its first untilS seconds ('plan_start': the
-# video's first pieces get theirs in a fraction of the time). One measurement at a time, in the order asked.
+# video's first pieces get theirs in a fraction of the time). A stream window's stems dir (<job>_w<k>) gets its own plan, which
+# its lines' /mix_cue renders against. PLAN_RUNS measurements at a time (each forks its own pool on half the cores), in the
+# order asked: the windows of several viewers do not queue behind one another.
 PLANS = ('plan', 'plan_start')
-_plan_run = threading.Lock()
+_plan_run = threading.BoundedSemaphore(int(os.environ.get('STUDIO_PLAN_RUNS', '2')))
 _plan_until: dict[str, float] = {}  # plan being measured -> seconds it will cover
 
 
@@ -586,17 +592,54 @@ async def mix_piece(**p) -> dict:
 
 
 # ---------------------------------------------------------------- /mix_cue
+LINE_PLAN_WAIT_S = 20  # longest a line waits for its window's plan still being measured (the caller's planWaitS, capped)
+LINE_PLANS = 12        # loaded window plans kept in memory (a few windows of a few viewers)
+_line_plans: dict[str, object] = {}
+_line_plans_lock = threading.Lock()
+
+
+def line_plan(d: Path, wait_s: float):
+    """The window's plan loaded for its lines (the lab's mix_line.Plan) when its measurement is ready or finishes within
+    wait_s, else None (the line is mixed dry, as before)."""
+    if not plan_covers(d, 'plan'):
+        with _plan_lock:
+            job = _plan_jobs.get(f'{d}/plan')
+        if job is None or wait_s <= 0:
+            return None
+        with contextlib.suppress(Exception):
+            job.result(timeout=wait_s)
+        if not plan_covers(d, 'plan'):
+            return None
+    path = str(plan_data(d, 'plan'))
+    with _line_plans_lock:
+        plan = _line_plans.get(path)
+    if plan is None:
+        import mix_line
+        plan = mix_line.Plan(path)
+        with _line_plans_lock:
+            _line_plans[path] = plan
+            while len(_line_plans) > LINE_PLANS:
+                _line_plans.pop(next(iter(_line_plans)))
+    return plan
+
+
 def mix_cue_blocking(p: dict) -> dict:
-    """One dub line mixed against the original line in its slot (the lab's mix_cue.py: level, tone, balance; no room)."""
+    """One dub line mixed against the original line in its slot. With `netflix` and a plan of the stems (/mix_plan, a stream
+    window's): the draft's netflix voice chain (the lab's mix_line.py: level, the location's tone and room, dynamics,
+    perspective; the take placed at dubStartS, its room tail kept up to tailEndS); else the dry treatment (the lab's
+    mix_cue.py: level, tone, balance; no room)."""
     import numpy as np
     import soundfile as sf
     from scipy.signal import resample_poly
     try:
         start_s, end_s = float(p['startS']), float(p['endS'])
+        dub_start = float(p.get('dubStartS', start_s))
+        tail_end = None if p.get('tailEndS') is None else float(p['tailEndS'])
+        plan_wait = min(max(float(p.get('planWaitS') or 0), 0.0), LINE_PLAN_WAIT_S)
     except (KeyError, TypeError, ValueError) as e:
         raise Fail('bad_request', repr(e))
-    if start_s < 0 or not 0 < end_s - start_s <= 60:
-        raise Fail('bad_request', 'need 0 <= startS < endS <= startS + 60')
+    if start_s < 0 or not 0 < end_s - start_s <= 60 or dub_start < 0 or (tail_end is not None and tail_end <= dub_start):
+        raise Fail('bad_request', 'need 0 <= startS < endS <= startS + 60, dubStartS >= 0, tailEndS > dubStartS')
     import mix_cue as lab_mix
     t0 = time.time()
     try:
@@ -609,9 +652,20 @@ def mix_cue_blocking(p: dict) -> dict:
     if rate != lab_mix.SR:
         dub = resample_poly(dub, lab_mix.SR, rate).astype(np.float32)
     take_s = len(dub) / lab_mix.SR
+    d = stems_for(p, max(end_s, dub_start + take_s))  # the context is cut to what the stems hold
+    if p.get('netflix'):
+        t_plan = time.time()
+        plan = line_plan(d, plan_wait)
+        waited = time.time() - t_plan
+        if plan is not None:
+            import mix_line
+            out = mix_line.render(plan, start_s, end_s, dub, dub_start, tail_end)
+            buf = io.BytesIO()
+            sf.write(buf, out.T, lab_mix.SR, format='FLAC', subtype='PCM_16')
+            return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': True,
+                    'timings': {'total_s': round(time.time() - t0, 3), 'plan_wait_s': round(waited, 2)}}
     half = max(take_s, end_s - start_s, lab_mix.CONTEXT_S) / 2 + 1
     mid = start_s + (end_s - start_s) / 2
-    d = stems_for(p, max(end_s, start_s + take_s))  # the context is cut to what the stems hold
     with using(d.name):
         info = sf.info(str(d / 'speech.flac'))
         a = max(0, int((mid - half) * info.samplerate))
@@ -623,7 +677,7 @@ def mix_cue_blocking(p: dict) -> dict:
     out = lab_mix.mix_cue(slot, context, dub)
     buf = io.BytesIO()
     sf.write(buf, out.T, lab_mix.SR, format='FLAC', subtype='PCM_16')
-    return {'mix': base64.b64encode(buf.getvalue()).decode(), 'timings': {'total_s': round(time.time() - t0, 3)}}
+    return {'mix': base64.b64encode(buf.getvalue()).decode(), 'netflix': False, 'timings': {'total_s': round(time.time() - t0, 3)}}
 
 
 async def mix_cue(**p) -> dict:
